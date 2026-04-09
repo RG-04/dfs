@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package dfs;
+
+// Each DataNode in Phase 1 is a degenerate Raft group of size 1.
+// In Phase 2 this service is implemented by the Raft group leader;
+// the MasterNode and client are unchanged.
+service DataNode {
+  // Block lifecycle (called by MasterNode only)
+  rpc RegisterBlock (RegisterBlockRequest) returns (RegisterBlockResponse);
+  rpc DeleteBlock   (DeleteBlockRequest)   returns (DeleteBlockResponse);
+
+  // Data plane (called by DFS client only)
+  //
+  // Both RPCs work at sub-block granularity: a client writing 3 bytes into
+  // the middle of a 64 MiB block sends a WriteBlock with those 3 bytes and
+  // the intra_block_offset of the first byte.  The DataNode seeks to that
+  // position within its on-disk block file and writes only those bytes.
+  rpc ReadBlock  (ReadBlockRequest)  returns (ReadBlockResponse);
+  rpc WriteBlock (WriteBlockRequest) returns (WriteBlockResponse);
+}
+
+// ── Block lifecycle ────────────────────────────────────────────────────────
+
+message RegisterBlockRequest  { string block_id = 1; }
+message RegisterBlockResponse { bool ok = 1; string error = 2; }
+
+message DeleteBlockRequest    { string block_id = 1; }
+message DeleteBlockResponse   { bool ok = 1; string error = 2; }
+
+// ── Data plane ─────────────────────────────────────────────────────────────
+//
+// intra_block_offset: byte offset *within* the block file (0 = first byte
+//   of this block).  The DFS client computes this as:
+//
+//     intra_block_offset = file_offset % block_size
+//
+//   where file_offset is the raw byte position in the logical file.
+
+message ReadBlockRequest {
+  string block_id          = 1;
+  int64  intra_block_offset = 2;
+  int64  length             = 3;
+}
+
+message ReadBlockResponse {
+  bool   ok    = 1;
+  string error = 2;
+  bytes  data  = 3;
+}
+
+message WriteBlockRequest {
+  string block_id           = 1;
+  int64  intra_block_offset = 2;
+  bytes  data               = 3;
+}
+
+message WriteBlockResponse {
+  bool   ok    = 1;
+  string error = 2;
+}

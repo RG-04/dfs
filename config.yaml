@@ -1,0 +1,28 @@
+# DFS Phase-1 configuration
+#
+# block_size: bytes per block.  1 MiB is a reasonable test default;
+# production systems typically use 64–128 MiB.  Keep below the gRPC
+# message size limit configured in the code (128 MiB).
+
+block_size: 1048576   # 1 MiB
+
+master:
+  host: "127.0.0.1"
+  port: 50051
+  metadata_dir: "/tmp/dfs/master"
+
+datanodes:
+  - id: dn0
+    host: "127.0.0.1"
+    port: 50052
+    data_dir: "/tmp/dfs/dn0"
+
+  - id: dn1
+    host: "127.0.0.1"
+    port: 50053
+    data_dir: "/tmp/dfs/dn1"
+
+  - id: dn2
+    host: "127.0.0.1"
+    port: 50054
+    data_dir: "/tmp/dfs/dn2"

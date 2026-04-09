@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package dfs;
+
+service MasterNode {
+  rpc CreateFile       (CreateFileRequest)    returns (CreateFileResponse);
+  rpc DeleteFile       (DeleteFileRequest)    returns (DeleteFileResponse);
+  rpc GetBlockInfo     (GetBlockInfoRequest)  returns (GetBlockInfoResponse);
+  rpc RegisterDataNode (RegisterDNRequest)    returns (RegisterDNResponse);
+}
+
+// ── File operations ────────────────────────────────────────────────────────
+
+message CreateFileRequest  { string path = 1; }
+message CreateFileResponse { bool ok = 1; string error = 2; }
+
+message DeleteFileRequest  { string path = 1; }
+message DeleteFileResponse { bool ok = 1; string error = 2; }
+
+// ── Block routing ──────────────────────────────────────────────────────────
+
+enum Intent {
+  READ  = 0;
+  WRITE = 1;
+}
+
+message GetBlockInfoRequest {
+  string path        = 1;
+  int32  block_index = 2;
+  Intent intent      = 3;
+}
+
+message BlockInfo {
+  string block_id       = 1;
+  string datanode_id    = 2;
+  string datanode_host  = 3;
+  int32  datanode_port  = 4;
+}
+
+message GetBlockInfoResponse {
+  bool      ok    = 1;
+  string    error = 2;
+  BlockInfo block = 3;
+}
+
+// ── DataNode registration ──────────────────────────────────────────────────
+
+message RegisterDNRequest {
+  string datanode_id = 1;
+  string host        = 2;
+  int32  port        = 3;
+}
+
+message RegisterDNResponse {
+  bool   ok    = 1;
+  string error = 2;
+}
