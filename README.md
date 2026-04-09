@@ -190,24 +190,33 @@ After restarting a DataNode, it re-registers with the MasterNode on the next hea
 
 ---
 
+## Phase 1.5 — Failure detection
+
+Before adding replication, the MasterNode should detect DataNode failures using the heartbeats DataNodes already send (periodic `RegisterDataNode` RPCs every 10 seconds). The MasterNode will track the last heartbeat timestamp for each registered DataNode and mark a node as unavailable if no heartbeat is received within a configurable timeout. Unavailable nodes will be excluded from new block assignments, and client requests for blocks on a failed node will return an appropriate error.
+
+
+---
+
 ## Phase 2 — Replication roadmap
 
-Phase 2 will replace each single DataNode with a **3-node Raft group**, providing fault-tolerant block storage. The MasterNode and DFSClient require no changes.
+Phase 2 introduces per-block Raft groups for fault-tolerant block storage. Rather than replacing each DataNode with a dedicated Raft cluster, **each block has its own independent Raft group** composed of a subset of the existing DataNodes. A DataNode participates in many Raft groups simultaneously — acting as leader for some blocks and follower for others. Raft state (log, term, commit index) is maintained independently per block on each DataNode.
 
-### Planned changes
+The DFSClient will require only minimal changes; the MasterNode will require targeted updates to support Raft-based replication. Note that having detected failed nodes, a MasterNode should reject client requests for operations in blocks who's leader is in a failed node. On failure, eventually a successful election will inform the MasterNode that there is a new leader with a new term, and it can resume accepting client requests.
+
+### Planned changes (GUIDELINES, NOT STRICT)
 
 | Component | Change |
 |---|---|
-| `DataNode` service | Implement the same `datanode.proto` interface on the Raft **leader**. `WriteBlock` becomes a linearised Raft log entry replicated to followers before ACKing the client. |
-| `RegisterBlock` | Raft leader registers block and replicates the fact to followers. |
-| `DeleteBlock` | Leader commits deletion through the log. |
-| `ReadBlock` | Leader serves reads (or followers after a lease check for linearisability). |
-| MasterNode | Unchanged — it still assigns a group ID (formerly DataNode ID) to each block. |
+| `DataNode` service | Each DataNode runs one Raft instance per block it participates in. `WriteBlock` on the group leader becomes a linearised Raft log entry replicated to the other members before ACKing the client. |
+| `RegisterBlock` | MasterNode assigns a Raft group (a subset of DataNodes) to the block. The designated leader registers the block and replicates the fact to its followers. |
+| `DeleteBlock` | The block's Raft leader commits deletion through its log. |
+| `ReadBlock` | The block's current leader serves reads (or followers after a lease check for linearisability). |
+| MasterNode | Requires changes — must track the current leader of each block's Raft group to route `GetBlockInfo` responses to the right DataNode. |
 | DFSClient | Unchanged — it still contacts the address returned by `GetBlockInfo`. |
-| Config | Each `datanodes` entry becomes a Raft group entry with 3 member addresses. |
+| Config | Each `datanodes` entry remains a single node; replication factor and group-assignment strategy are added as new config fields. |
 
 ### Key design invariants preserved
 
 - The `DataNode` gRPC service is the **only interface boundary** between the storage layer and the rest of the system.
-- Block ownership is enforced at the DataNode level — the leader rejects requests for blocks it has not committed to its log.
+- Raft membership and leadership are per-block — a DataNode's failure affects only the blocks for which it holds a role, not all storage.
 - The client's offset-decomposition logic (`block_index = file_offset // block_size`) is independent of the replication strategy.

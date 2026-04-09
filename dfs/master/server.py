@@ -5,9 +5,8 @@ Waits for every configured DataNode to register before accepting client
 requests.  All metadata is written atomically to disk so the node
 survives restarts.
 
-Phase-2 note: The only change needed for replication is that
-_assign_datanode returns a Raft-group ID instead of a single DataNode
-ID, and RegisterBlock / DeleteBlock are forwarded to the group leader.
+Phase-2 note: The MasterNode will require changes to track the current
+leader of each Raft group and route block operations accordingly.
 """
 
 import asyncio
@@ -50,6 +49,9 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         self._registered_dns: Dict[str, dict] = {}  # id → {host, port}
         self._ready = asyncio.Event()
         self._lock = asyncio.Lock()
+
+        # Global round-robin counter for DataNode assignment
+        self._rr_counter: int = 0
 
         # File namespace: path → {"blocks": [{"block_id": str, "datanode_id": str}]}
         self._files: Dict[str, dict] = {}
@@ -208,7 +210,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     )
                 if block_index == num_blocks:
                     # Allocate a new block on a chosen DataNode.
-                    dn_id = self._round_robin_dn(num_blocks)
+                    dn_id = self._round_robin_dn()
                     block_id = str(uuid.uuid4())
                     dn_info = self._registered_dns[dn_id]
 
@@ -265,10 +267,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 ),
             )
 
-    def _round_robin_dn(self, num_existing_blocks: int) -> str:
-        """Assign the next block to a DataNode via round-robin."""
+    def _round_robin_dn(self) -> str:
+        """Assign the next block to a DataNode via global round-robin."""
         dn_ids = sorted(self._registered_dns)  # stable order
-        return dn_ids[num_existing_blocks % len(dn_ids)]
+        dn_id = dn_ids[self._rr_counter % len(dn_ids)]
+        self._rr_counter += 1
+        return dn_id
 
 
 # ── Server bootstrap ───────────────────────────────────────────────────────
