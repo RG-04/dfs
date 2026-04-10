@@ -40,6 +40,10 @@ message ReadBlockRequest {
   string block_id           = 1;
   int64  intra_block_offset = 2;
   int64  length             = 3;
+  // Minimum Raft term this node must have exceeded to serve the request.
+  // Set by the client from BlockInfo.min_leader_term returned by the Master.
+  // The node rejects if own_term <= min_term (stale/isolated leader guard).
+  int64  min_term           = 4;
 }
 
 message ReadBlockResponse {
@@ -52,6 +56,9 @@ message WriteBlockRequest {
   string block_id           = 1;
   int64  intra_block_offset = 2;
   bytes  data               = 3;
+  // Same semantics as ReadBlockRequest.min_term — enables early detection of
+  // a write that will fail anyway due to the leader being isolated.
+  int64  min_term           = 4;
 }
 
 message WriteBlockResponse {

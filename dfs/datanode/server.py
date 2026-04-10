@@ -258,6 +258,21 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
                 error=f"not leader (leader={raft.leader_id})",
             )
 
+        min_term = request.min_term
+        if raft.current_term <= min_term:
+            logger.warning(
+                "WriteBlock %.8s: stale leader guard triggered "
+                "(own_term=%d <= min_term=%d) — rejecting",
+                block_id, raft.current_term, min_term,
+            )
+            return datanode_pb2.WriteBlockResponse(
+                ok=False,
+                error=(
+                    f"stale leader: own term {raft.current_term} "
+                    f"not above min_term {min_term}"
+                ),
+            )
+
         ok, err = await raft.append_and_replicate(
             request.intra_block_offset, request.data
         )
@@ -287,6 +302,22 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
                 ok=False,
                 error=f"not leader (leader={raft.leader_id})",
             )
+
+        if raft:
+            min_term = request.min_term
+            if raft.current_term <= min_term:
+                logger.warning(
+                    "ReadBlock %.8s: stale leader guard triggered "
+                    "(own_term=%d <= min_term=%d) — rejecting",
+                    block_id, raft.current_term, min_term,
+                )
+                return datanode_pb2.ReadBlockResponse(
+                    ok=False,
+                    error=(
+                        f"stale leader: own term {raft.current_term} "
+                        f"not above min_term {min_term}"
+                    ),
+                )
 
         p = self._block_path(block_id)
         if not p.exists():

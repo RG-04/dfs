@@ -15,12 +15,14 @@ from pathlib import Path
 from typing import Optional
 
 import grpc
+from grpc import aio
 import pytest
 import pytest_asyncio
 import yaml
 
 from dfs.client.client import DFSClient, DFSError
 from dfs.proto import master_pb2, master_pb2_grpc
+from dfs.proto import datanode_pb2, datanode_pb2_grpc
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -687,6 +689,166 @@ class TestFailureDetection:
                 await client.delete(path)
             except DFSError:
                 pass
+
+
+# ── Term guard tests ──────────────────────────────────────────────────────
+
+class TestTermGuard:
+    """Verify the stale-leader term guard on the DataNode data plane.
+
+    Normal client I/O uses the min_leader_term supplied by the Master.
+    These tests also directly call the DataNode gRPC to probe the guard
+    boundary without going through the client abstraction.
+    """
+
+    async def test_normal_write_and_read_pass_term_check(
+        self, dfs_client, cluster_config, block_size
+    ):
+        """End-to-end write + read must succeed with the term supplied by
+        the Master (regression: ensure the check does not break normal I/O)."""
+        path = "/test/term_guard_normal.bin"
+        try:
+            await dfs_client.delete(path)
+        except DFSError:
+            pass
+
+        await dfs_client.create(path)
+        data = b"TERM_GUARD_OK" * 50
+        await dfs_client.write(path, offset=0, data=data)
+        result = await dfs_client.read(path, offset=0, length=len(data))
+        assert result == data
+
+        await dfs_client.delete(path)
+
+    async def test_inflated_min_term_rejects_write(
+        self, dfs_client, cluster_config, block_size
+    ):
+        """A write with min_term set above the node's current term must be
+        rejected with a 'stale leader' error."""
+        import json
+
+        path = "/test/term_guard_write.bin"
+        try:
+            await dfs_client.delete(path)
+        except DFSError:
+            pass
+        await dfs_client.create(path)
+
+        # Write once to allocate the block and elect a leader.
+        await dfs_client.write(path, offset=0, data=b"X" * 64)
+
+        # Read the block metadata to find the leader node's address.
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        dn_info   = next(
+            dn for dn in cluster_config["datanodes"] if dn["id"] == leader_id
+        )
+        addr     = f"{dn_info['host']}:{dn_info['port']}"
+        block_id = blk["block_id"]
+
+        # Call WriteBlock directly with a min_term far above any realistic term.
+        inflated_min_term = 9999
+        async with aio.insecure_channel(addr) as ch:
+            stub = datanode_pb2_grpc.DataNodeStub(ch)
+            resp = await stub.WriteBlock(
+                datanode_pb2.WriteBlockRequest(
+                    block_id=block_id,
+                    intra_block_offset=0,
+                    data=b"STALE",
+                    min_term=inflated_min_term,
+                )
+            )
+
+        assert not resp.ok, "Expected rejection for inflated min_term"
+        assert "stale" in resp.error.lower(), f"Unexpected error: {resp.error}"
+
+        await dfs_client.delete(path)
+
+    async def test_inflated_min_term_rejects_read(
+        self, dfs_client, cluster_config, block_size
+    ):
+        """A read with min_term set above the node's current term must be
+        rejected with a 'stale leader' error."""
+        import json
+
+        path = "/test/term_guard_read.bin"
+        try:
+            await dfs_client.delete(path)
+        except DFSError:
+            pass
+        await dfs_client.create(path)
+        await dfs_client.write(path, offset=0, data=b"Y" * 64)
+
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        dn_info   = next(
+            dn for dn in cluster_config["datanodes"] if dn["id"] == leader_id
+        )
+        addr     = f"{dn_info['host']}:{dn_info['port']}"
+        block_id = blk["block_id"]
+
+        inflated_min_term = 9999
+        async with aio.insecure_channel(addr) as ch:
+            stub = datanode_pb2_grpc.DataNodeStub(ch)
+            resp = await stub.ReadBlock(
+                datanode_pb2.ReadBlockRequest(
+                    block_id=block_id,
+                    intra_block_offset=0,
+                    length=64,
+                    min_term=inflated_min_term,
+                )
+            )
+
+        assert not resp.ok, "Expected rejection for inflated min_term"
+        assert "stale" in resp.error.lower(), f"Unexpected error: {resp.error}"
+
+        await dfs_client.delete(path)
+
+    async def test_zero_min_term_always_passes(
+        self, dfs_client, cluster_config, block_size
+    ):
+        """min_term=0 must never block a legitimate leader (own_term >= 1)."""
+        import json
+
+        path = "/test/term_guard_zero.bin"
+        try:
+            await dfs_client.delete(path)
+        except DFSError:
+            pass
+        await dfs_client.create(path)
+        await dfs_client.write(path, offset=0, data=b"Z" * 64)
+
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        dn_info   = next(
+            dn for dn in cluster_config["datanodes"] if dn["id"] == leader_id
+        )
+        addr     = f"{dn_info['host']}:{dn_info['port']}"
+        block_id = blk["block_id"]
+
+        async with aio.insecure_channel(addr) as ch:
+            stub = datanode_pb2_grpc.DataNodeStub(ch)
+            resp = await stub.ReadBlock(
+                datanode_pb2.ReadBlockRequest(
+                    block_id=block_id,
+                    intra_block_offset=0,
+                    length=64,
+                    min_term=0,
+                )
+            )
+
+        assert resp.ok, f"Expected success with min_term=0, got: {resp.error}"
+
+        await dfs_client.delete(path)
 
 
 # ── Phase-2 tests: Raft persistence and recovery ──────────────────────────

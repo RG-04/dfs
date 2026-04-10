@@ -274,6 +274,7 @@ class DFSClient:
                         block_id=block.block_id,
                         intra_block_offset=intra_block_offset,
                         data=data,
+                        min_term=block.min_leader_term,
                     )
                 )
         except grpc.RpcError as exc:
@@ -298,6 +299,7 @@ class DFSClient:
                         block_id=block.block_id,
                         intra_block_offset=intra_block_offset,
                         length=length,
+                        min_term=block.min_leader_term,
                     )
                 )
         except grpc.RpcError as exc:

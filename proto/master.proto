@@ -82,6 +82,11 @@ message BlockInfo {
   string datanode_id    = 2;
   string datanode_host  = 3;
   int32  datanode_port  = 4;
+  // Stale-leader guard: the last Raft election term the Master is aware of,
+  // minus one.  The DataNode must have term strictly greater than this value
+  // to serve the request.  A leader isolated before the latest election will
+  // have an equal or lower term and will correctly reject the request.
+  int64  min_leader_term = 5;
 }
 
 message GetBlockInfoResponse {

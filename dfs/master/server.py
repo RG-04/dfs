@@ -578,6 +578,14 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     error=f"Leader DataNode {leader_dn} not registered",
                 )
 
+            # min_leader_term is one below the last known election term.
+            # A DataNode must have current_term > min_leader_term to serve
+            # the request, which means it must be at term >= last_known_term.
+            # This rejects isolated leaders that were superseded by a newer
+            # election the Master already knows about.
+            last_known_term = status["term"] if status else 1
+            min_leader_term = max(0, last_known_term - 1)
+
             return master_pb2.GetBlockInfoResponse(
                 ok=True,
                 block=master_pb2.BlockInfo(
@@ -585,6 +593,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     datanode_id=leader_dn,
                     datanode_host=dn_info["host"],
                     datanode_port=dn_info["port"],
+                    min_leader_term=min_leader_term,
                 ),
             )
 
