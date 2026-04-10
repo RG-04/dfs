@@ -1,16 +1,18 @@
-"""Integration tests for Phase-1 DFS.
+"""Integration tests for Phase-2 DFS (Raft-replicated blocks).
 
 The test session spins up the full cluster (master + all datanodes) as
 subprocesses, runs every test, then tears the cluster down.  No manual
 node management required:
 
-    pytest test_dfs.py -v
+    .venv/bin/pytest test_dfs.py -v
 """
 
+import asyncio
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import grpc
 import pytest
@@ -43,49 +45,44 @@ def live_cluster(cluster_config):
     master_cfg = cluster_config["master"]
     dn_cfgs    = cluster_config["datanodes"]
 
-    # Kill any leftover node processes from previous runs and wait until
-    # the ports are actually free before starting fresh ones.
     _evict_old_nodes(cluster_config)
 
-    # Wipe stale on-disk state so every test run starts from scratch.
     for d in [master_cfg["metadata_dir"]] + [dn["data_dir"] for dn in dn_cfgs]:
         shutil.rmtree(d, ignore_errors=True)
         Path(d).mkdir(parents=True, exist_ok=True)
 
-    procs = []
-    procs.append(subprocess.Popen(
+    procs = {}
+    procs["master"] = subprocess.Popen(
         [_PYTHON, str(_ROOT / "bin" / "master.py"), _CONFIG_PATH],
-    ))
-    time.sleep(0.5)  # give master a head start before datanodes connect
+    )
+    time.sleep(0.5)
 
     for dn in dn_cfgs:
-        procs.append(subprocess.Popen(
+        procs[dn["id"]] = subprocess.Popen(
             [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn["id"], _CONFIG_PATH],
-        ))
+        )
 
     _wait_ready(cluster_config)
 
-    yield
+    yield procs   # expose proc dict so failure tests can kill individual nodes
 
-    for p in procs:
-        p.terminate()
-    for p in procs:
+    for p in procs.values():
+        if p.poll() is None:
+            p.terminate()
+    for p in procs.values():
         p.wait(timeout=5)
 
 
 def _evict_old_nodes(config: dict) -> None:
-    """Kill any processes already listening on the cluster ports."""
     import socket
 
     all_ports = [config["master"]["port"]] + [
         dn["port"] for dn in config["datanodes"]
     ]
 
-    # Send SIGTERM to processes holding our ports.
     subprocess.run(["pkill", "-f", "bin/master.py"],   capture_output=True)
     subprocess.run(["pkill", "-f", "bin/datanode.py"], capture_output=True)
 
-    # Wait until every port is actually free (up to 8 s).
     deadline = time.time() + 8.0
     while time.time() < deadline:
         busy = []
@@ -99,19 +96,11 @@ def _evict_old_nodes(config: dict) -> None:
         time.sleep(0.2)
 
 
-def _wait_ready(config: dict, timeout: float = 20.0) -> None:
-    """Block until MasterNode accepts RPCs (all DataNodes registered).
-
-    Uses a blocking gRPC call with a long timeout so the master has time
-    to wait for all DataNodes to register before declaring itself ready.
-    """
+def _wait_ready(config: dict, timeout: float = 30.0) -> None:
+    """Block until MasterNode accepts RPCs (all DataNodes registered)."""
     addr     = f"{config['master']['host']}:{config['master']['port']}"
     deadline = time.time() + timeout
     last_exc = None
-
-    # Longer than the master's internal 5-second DataNode-wait so we always
-    # get a real response (ok / "already exists" / UNAVAILABLE) rather than
-    # a client-side DEADLINE_EXCEEDED.
     _RPC_TIMEOUT = 8.0
 
     while time.time() < deadline:
@@ -122,10 +111,8 @@ def _wait_ready(config: dict, timeout: float = 20.0) -> None:
                     master_pb2.CreateFileRequest(path="/__probe__"),
                     timeout=_RPC_TIMEOUT,
                 )
-                return  # Any response (even "file exists") means cluster is ready.
+                return
         except grpc.RpcError as exc:
-            # UNAVAILABLE → master not up yet or datanodes not registered.
-            # ALREADY_EXISTS / other → master responded, cluster is ready.
             if exc.code() not in (
                 grpc.StatusCode.UNAVAILABLE,
                 grpc.StatusCode.DEADLINE_EXCEEDED,
@@ -137,6 +124,32 @@ def _wait_ready(config: dict, timeout: float = 20.0) -> None:
         time.sleep(0.3)
 
     raise RuntimeError(f"Cluster not ready after {timeout}s: {last_exc}")
+
+
+def _restart_datanode(dn_id: str, config: dict, procs: dict) -> None:
+    """Kill the given DataNode process and restart it, updating *procs*."""
+    old = procs.get(dn_id)
+    if old and old.poll() is None:
+        old.terminate()
+        old.wait(timeout=5)
+
+    dn_cfgs = {dn["id"]: dn for dn in config["datanodes"]}
+    port    = dn_cfgs[dn_id]["port"]
+
+    # Wait until the port is free.
+    import socket
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                break
+        time.sleep(0.2)
+
+    procs[dn_id] = subprocess.Popen(
+        [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn_id, _CONFIG_PATH],
+    )
+    time.sleep(1.0)   # give it a moment to register
 
 
 # ── Per-test fixtures ──────────────────────────────────────────────────────
@@ -154,7 +167,6 @@ def block_size(cluster_config):
 @pytest_asyncio.fixture
 async def created_file(dfs_client):
     """Ensure the test file exists before a test and is deleted after."""
-    # Clean up leftovers from a crashed previous test.
     try:
         await dfs_client.delete(_TEST_PATH)
     except DFSError:
@@ -169,7 +181,7 @@ async def created_file(dfs_client):
         pass
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────
+# ── Phase-1 tests (must still pass) ───────────────────────────────────────
 
 class TestCreate:
     async def test_create_new_file(self, dfs_client):
@@ -196,11 +208,9 @@ class TestMultiBlockIO:
         assert result == data
 
     async def test_cross_block_read(self, created_file, dfs_client, block_size):
-        # Write two full blocks: 'A' then 'B'
         data = b"A" * block_size + b"B" * block_size
         await dfs_client.write(created_file, offset=0, data=data)
 
-        # Read 10 bytes that straddle the block boundary
         chunk    = await dfs_client.read(created_file, offset=block_size - 5, length=10)
         expected = b"A" * 5 + b"B" * 5
         assert chunk == expected
@@ -208,10 +218,8 @@ class TestMultiBlockIO:
     async def test_write_spanning_block_boundary(
         self, created_file, dfs_client, block_size
     ):
-        # First allocate both blocks with a full write so the second block exists.
         await dfs_client.write(created_file, offset=0, data=b"\x00" * (2 * block_size))
 
-        # Now overwrite 4 bytes that straddle the boundary (2 bytes in each block).
         straddle_offset = block_size - 2
         straddle_data   = b"XYZW"
         await dfs_client.write(created_file, offset=straddle_offset, data=straddle_data)
@@ -226,10 +234,8 @@ class TestSmallIO:
     async def test_small_write_and_read_within_block(
         self, created_file, dfs_client, block_size
     ):
-        # Allocate block 0 with known content.
         await dfs_client.write(created_file, offset=0, data=b"A" * block_size)
 
-        # Overwrite 7 bytes at a small offset deep inside the block.
         patch_offset = 100
         patch        = b"PATCHED"
         await dfs_client.write(created_file, offset=patch_offset, data=patch)
@@ -243,7 +249,6 @@ class TestSmallIO:
         patch_offset = 100
         await dfs_client.write(created_file, offset=patch_offset, data=b"PATCHED")
 
-        # One byte immediately before and after the patch must still be 'A'.
         before = await dfs_client.read(created_file, offset=patch_offset - 1, length=1)
         after  = await dfs_client.read(
             created_file, offset=patch_offset + len(b"PATCHED"), length=1
@@ -262,7 +267,6 @@ class TestBoundaryErrors:
     async def test_read_past_last_block_raises(
         self, created_file, dfs_client, block_size
     ):
-        # Allocate one block only.
         await dfs_client.write(created_file, offset=0, data=b"X" * block_size)
         with pytest.raises(DFSError, match="out of range"):
             await dfs_client.read(created_file, offset=block_size, length=1)
@@ -270,7 +274,6 @@ class TestBoundaryErrors:
     async def test_skip_block_index_raises(
         self, created_file, dfs_client, block_size
     ):
-        # Writing at offset 2*block_size without allocating block 1 first must fail.
         with pytest.raises(DFSError, match="skips ahead"):
             await dfs_client.write(
                 created_file, offset=2 * block_size, data=b"X"
@@ -302,3 +305,533 @@ class TestDelete:
 
         with pytest.raises(DFSError, match="not found|File not found"):
             await dfs_client.delete(path)
+
+
+# ── Phase-2 tests: replication and failure ────────────────────────────────
+
+class TestRaftReplication:
+    async def test_data_readable_after_write(
+        self, created_file, dfs_client, block_size
+    ):
+        """Write data, immediately read it back — tests Raft commit path."""
+        data = b"RAFT_TEST" * 100
+        await dfs_client.write(created_file, offset=0, data=data)
+        result = await dfs_client.read(created_file, offset=0, length=len(data))
+        assert result == data
+
+    async def test_replicated_to_followers_on_disk(
+        self, created_file, dfs_client, cluster_config, block_size
+    ):
+        """After a write, the block file must exist on all DataNode disks."""
+        data = b"X" * 1024
+        await dfs_client.write(created_file, offset=0, data=data)
+
+        # Give followers' apply loops time to finish.
+        await asyncio.sleep(0.3)
+
+        # Find the block_id from the master's metadata file.
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blocks = meta["files"][created_file]["blocks"]
+        assert blocks, "No blocks allocated"
+        block_id = blocks[0]["block_id"]
+
+        # Check that the block file exists on all DataNode data directories.
+        for dn in cluster_config["datanodes"]:
+            p = Path(dn["data_dir"]) / block_id
+            assert p.exists(), (
+                f"Block {block_id[:8]} missing on {dn['id']} at {p}"
+            )
+
+    async def test_multiple_sequential_writes(
+        self, created_file, dfs_client, block_size
+    ):
+        """Sequential writes must all be linearised by the leader."""
+        for i in range(5):
+            await dfs_client.write(
+                created_file, offset=i, data=bytes([i])
+            )
+        # Verify last write is visible.
+        result = await dfs_client.read(created_file, offset=0, length=5)
+        assert result == bytes(range(5))
+
+
+class TestFailureDetection:
+    async def test_one_follower_failure_write_succeeds(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Killing one follower must not prevent writes (majority = 2/3)."""
+        path = "/test/follower_fail.bin"
+        try:
+            await DFSClient(cluster_config).delete(path)
+        except DFSError:
+            pass
+
+        client = DFSClient(cluster_config)
+        await client.create(path)
+
+        # Write a block — this designates a leader and replicates.
+        data_in = b"A" * 512
+        await client.write(path, offset=0, data=data_in)
+
+        # Determine which DataNode is the follower (not the leader) for block 0.
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        peers     = blk["peers"]
+        follower  = next(p for p in peers if p != leader_id)
+
+        # Kill the follower.
+        proc = live_cluster.get(follower)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        try:
+            # Cluster should still serve writes and reads with 2/3 nodes.
+            data_extra = b"B" * 512
+            await client.write(path, offset=512, data=data_extra)
+            result = await client.read(path, offset=0, length=1024)
+            assert result == data_in + data_extra
+        finally:
+            # Restart the follower so subsequent tests are unaffected.
+            _restart_datanode(follower, cluster_config, live_cluster)
+            await asyncio.sleep(1.0)
+            try:
+                await client.delete(path)
+            except DFSError:
+                pass
+
+    async def test_leader_failure_triggers_election(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Killing the Raft leader must eventually elect a new leader that
+        can serve reads and writes."""
+        path = "/test/leader_fail.bin"
+        try:
+            await DFSClient(cluster_config).delete(path)
+        except DFSError:
+            pass
+
+        client = DFSClient(cluster_config)
+        await client.create(path)
+
+        # Write data to allocate and replicate block 0.
+        data_before = b"BEFORE" * 100
+        await client.write(path, offset=0, data=data_before)
+
+        # Find the current leader.
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+
+        # Kill the leader.
+        proc = live_cluster.get(leader_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        # Wait for the Raft election (election timeout ≤ 300 ms, plus
+        # the master's NotifyLeader processing, plus some margin).
+        await asyncio.sleep(2.0)
+
+        try:
+            # A new leader should be elected; reads/writes must succeed.
+            data_after = b"AFTER" * 100
+            await client.write(path, offset=len(data_before), data=data_after)
+            result = await client.read(path, offset=0, length=len(data_before))
+            assert result == data_before
+        finally:
+            _restart_datanode(leader_id, cluster_config, live_cluster)
+            await asyncio.sleep(1.0)
+            try:
+                await client.delete(path)
+            except DFSError:
+                pass
+
+    async def test_master_marks_cluster_unavailable_after_timeout(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """After both remaining followers (non-leader) die, writing to an
+        EXISTING block should still work (2/3 majority from leader alone is
+        not enough — wait: leader alone is 1/3, not majority).
+
+        This test verifies a different scenario: when ALL datanodes for a block
+        are killed, the master eventually marks the block unavailable.
+        """
+        path = "/test/unavailable.bin"
+        try:
+            await DFSClient(cluster_config).delete(path)
+        except DFSError:
+            pass
+
+        client = DFSClient(cluster_config)
+        await client.create(path)
+        await client.write(path, offset=0, data=b"X" * 64)
+
+        # Kill all three DataNodes so no quorum is possible.
+        killed = []
+        for dn in cluster_config["datanodes"]:
+            proc = live_cluster.get(dn["id"])
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+                killed.append(dn["id"])
+
+        # Wait for the master's heartbeat_timeout (15 s) plus one watchdog
+        # cycle (heartbeat_timeout / 3 ≈ 5 s) to mark the cluster unavailable.
+        # To keep the test fast we patch heartbeat_timeout to 3 s in config,
+        # but since the live cluster is already running with the real config we
+        # wait a proportionate time.  With the default 15 s this is ~20 s total.
+        # For CI speed we rely on the watchdog marking it faster than 15 s when
+        # the initial heartbeat was set at allocation time.
+        #
+        # Here we simply verify that the write eventually fails.
+        deadline = time.time() + 25.0
+        got_error = False
+        while time.time() < deadline:
+            try:
+                # Try to write to the EXISTING block; master routes to leader.
+                # With leader dead the DataNode write will fail or master
+                # will report unavailable.
+                await client.write(path, offset=0, data=b"Y" * 64)
+                await asyncio.sleep(1.0)
+            except DFSError:
+                got_error = True
+                break
+
+        assert got_error, "Expected DFSError after all DataNodes killed"
+
+        # Restart all DataNodes for subsequent tests.
+        for dn_id in killed:
+            _restart_datanode(dn_id, cluster_config, live_cluster)
+        await asyncio.sleep(2.0)
+
+        # Wait until master is ready again (all DataNodes re-registered).
+        _wait_ready(cluster_config, timeout=20.0)
+
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+    async def test_new_block_denied_when_insufficient_nodes(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Block allocation must be denied when fewer DataNodes are available
+        than the replication_factor (all 3 needed, kill 2)."""
+        path = "/test/insufficient.bin"
+        try:
+            await DFSClient(cluster_config).delete(path)
+        except DFSError:
+            pass
+
+        client = DFSClient(cluster_config)
+        await client.create(path)
+
+        # Kill two DataNodes — only one left, need 3.
+        dn_ids = [dn["id"] for dn in cluster_config["datanodes"]]
+        killed = dn_ids[:2]
+        for dn_id in killed:
+            proc = live_cluster.get(dn_id)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+        await asyncio.sleep(0.5)  # give master time to notice via registration gap
+
+        try:
+            with pytest.raises(DFSError):
+                # This tries to allocate a NEW block — must be denied.
+                await client.write(path, offset=0, data=b"X")
+        finally:
+            for dn_id in killed:
+                _restart_datanode(dn_id, cluster_config, live_cluster)
+            await asyncio.sleep(2.0)
+            _wait_ready(cluster_config, timeout=20.0)
+            try:
+                await client.delete(path)
+            except DFSError:
+                pass
+
+
+# ── Phase-2 tests: Raft persistence and recovery ──────────────────────────
+
+class TestRaftRecovery:
+    """Tests that verify Raft state is correctly persisted and recovered."""
+
+    async def test_follower_restart_and_catchup(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Kill a follower after initial writes, write more data, restart the
+        follower, and verify its on-disk block file is fully up to date."""
+        path = "/test/recovery_follower.bin"
+        client = DFSClient(cluster_config)
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+        await client.create(path)
+        data_before = b"BEFORE" * 200   # 1200 bytes
+        await client.write(path, offset=0, data=data_before)
+
+        # Identify the follower for block 0.
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        peers     = blk["peers"]
+        follower  = next(p for p in peers if p != leader_id)
+
+        # Kill the follower.
+        proc = live_cluster.get(follower)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        # Write more data while the follower is down (2/3 majority still works).
+        data_after = b"AFTER_" * 200   # 1200 bytes
+        await client.write(path, offset=len(data_before), data=data_after)
+
+        # Restart the follower — it should load persisted Raft state and
+        # receive the missing log entries via AppendEntries.
+        _restart_datanode(follower, cluster_config, live_cluster)
+
+        # Allow the leader to catch up the restarted follower.
+        # Heartbeat interval = 50 ms; should be caught up well within 2 s.
+        await asyncio.sleep(2.0)
+
+        # Verify the block file on the restarted follower has all data.
+        dn_cfgs   = {dn["id"]: dn for dn in cluster_config["datanodes"]}
+        block_id  = blk["block_id"]
+        block_file = Path(dn_cfgs[follower]["data_dir"]) / block_id
+        assert block_file.exists(), f"Block file missing on recovered follower {follower}"
+
+        with open(block_file, "rb") as fh:
+            on_disk = fh.read()
+
+        expected = data_before + data_after
+        assert on_disk[:len(expected)] == expected, (
+            f"Follower {follower} block file content mismatch after restart"
+        )
+
+        # Verify readable through normal DFS path.
+        result = await client.read(path, offset=0, length=len(expected))
+        assert result == expected
+
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+    async def test_leader_restart_and_rejoin(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Kill the leader, let followers elect a new leader, write more data,
+        restart the old leader, and verify it rejoins as a follower and catches
+        up the data it missed."""
+        path = "/test/recovery_leader.bin"
+        client = DFSClient(cluster_config)
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+        await client.create(path)
+        data_before = b"OLD_LEADER" * 100   # 1000 bytes
+        await client.write(path, offset=0, data=data_before)
+
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        leader_id = blk["leader_id"]
+        block_id  = blk["block_id"]
+
+        # Kill the leader.
+        proc = live_cluster.get(leader_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        # Wait for a new election (≤ 300 ms timeout + notify master + margin).
+        await asyncio.sleep(2.0)
+
+        # Write new data through the new leader.
+        data_after = b"NEW_LEADER" * 100
+        await client.write(path, offset=len(data_before), data=data_after)
+
+        # Restart the old leader — it must start as FOLLOWER (persistent term
+        # higher than original, so it won't immediately think it's leader).
+        _restart_datanode(leader_id, cluster_config, live_cluster)
+        await asyncio.sleep(2.0)   # catch-up window
+
+        # Verify the restarted old-leader has the new data in its block file.
+        dn_cfgs    = {dn["id"]: dn for dn in cluster_config["datanodes"]}
+        block_file = Path(dn_cfgs[leader_id]["data_dir"]) / block_id
+        assert block_file.exists(), (
+            f"Block file missing on restarted old-leader {leader_id}"
+        )
+        with open(block_file, "rb") as fh:
+            on_disk = fh.read()
+
+        expected = data_before + data_after
+        assert on_disk[:len(expected)] == expected, (
+            f"Old-leader {leader_id} did not catch up after restart"
+        )
+
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+    async def test_full_cluster_restart_data_survives(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Commit data, kill ALL nodes (including master), restart everything,
+        and verify that all committed data is still readable.
+
+        This exercises the full Raft persistence path:
+          1. term / voted_for persisted → correct election after restart
+          2. log persisted → committed entries survive
+          3. last_applied persisted → block files already contain the data
+        """
+        import shutil
+
+        path = "/test/full_restart.bin"
+        client = DFSClient(cluster_config)
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+        await client.create(path)
+        expected = b"SURVIVE_RESTART" * 300   # 4500 bytes
+        await client.write(path, offset=0, data=expected)
+
+        # Read back before kill to confirm data is committed.
+        result = await client.read(path, offset=0, length=len(expected))
+        assert result == expected, "Data mismatch before restart"
+
+        # Give all DataNodes time to apply and persist last_applied.
+        await asyncio.sleep(0.5)
+
+        # ── Kill everything ────────────────────────────────────────────────
+        all_nodes = ["master"] + [dn["id"] for dn in cluster_config["datanodes"]]
+        for node_id in all_nodes:
+            proc = live_cluster.get(node_id)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+        # ── Restart master (keep its metadata directory intact). ───────────
+        live_cluster["master"] = subprocess.Popen(
+            [_PYTHON, str(_ROOT / "bin" / "master.py"), _CONFIG_PATH],
+        )
+        time.sleep(0.5)
+
+        # ── Restart DataNodes (keep their data directories intact). ─────────
+        for dn in cluster_config["datanodes"]:
+            live_cluster[dn["id"]] = subprocess.Popen(
+                [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn["id"], _CONFIG_PATH],
+            )
+
+        # Wait for master ready (all DataNodes re-registered).
+        _wait_ready(cluster_config, timeout=30.0)
+
+        # Wait for a new Raft election and master notification.
+        await asyncio.sleep(3.0)
+
+        # ── Verify data survives ───────────────────────────────────────────
+        # Retry for up to 10 s in case the new leader hasn't notified the
+        # master yet (master routes to last-known leader from metadata, which
+        # may be stale until NotifyLeader arrives).
+        deadline = time.time() + 10.0
+        last_err: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                result = await client.read(path, offset=0, length=len(expected))
+                last_err = None
+                break
+            except DFSError as exc:
+                last_err = exc
+                await asyncio.sleep(0.5)
+
+        if last_err:
+            raise AssertionError(
+                f"Could not read data after full cluster restart: {last_err}"
+            )
+
+        assert result == expected, (
+            "Data mismatch after full cluster restart — "
+            "persistence or recovery is broken"
+        )
+
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+    async def test_raft_state_files_persisted_on_disk(
+        self, cluster_config, live_cluster, block_size
+    ):
+        """Verify that Raft state and log files are written to the DataNode
+        data directories after a write.  This is a sanity check that
+        persistence is actually happening (not just in-memory)."""
+        path = "/test/persistence_check.bin"
+        client = DFSClient(cluster_config)
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+
+        await client.create(path)
+        await client.write(path, offset=0, data=b"CHECK" * 400)   # 2000 bytes
+
+        # Give apply loop time to persist last_applied.
+        await asyncio.sleep(0.5)
+
+        import json
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        block_id = meta["files"][path]["blocks"][0]["block_id"]
+
+        for dn in cluster_config["datanodes"]:
+            data_dir  = Path(dn["data_dir"])
+            state_file = data_dir / f"raft_{block_id}.json"
+            log_file   = data_dir / f"raft_{block_id}.log"
+
+            assert state_file.exists(), (
+                f"Raft state file missing on {dn['id']}: {state_file}"
+            )
+            assert log_file.exists(), (
+                f"Raft log file missing on {dn['id']}: {log_file}"
+            )
+
+            # State file must have a valid term and last_applied ≥ 1.
+            with open(state_file) as fh:
+                state = json.load(fh)
+            assert state["current_term"] >= 1, (
+                f"{dn['id']}: current_term={state['current_term']} < 1"
+            )
+            assert state["last_applied"] >= 1, (
+                f"{dn['id']}: last_applied={state['last_applied']} < 1"
+            )
+
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass

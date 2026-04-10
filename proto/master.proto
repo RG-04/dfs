@@ -3,10 +3,16 @@ syntax = "proto3";
 package dfs;
 
 service MasterNode {
-  rpc CreateFile       (CreateFileRequest)    returns (CreateFileResponse);
-  rpc DeleteFile       (DeleteFileRequest)    returns (DeleteFileResponse);
-  rpc GetBlockInfo     (GetBlockInfoRequest)  returns (GetBlockInfoResponse);
-  rpc RegisterDataNode (RegisterDNRequest)    returns (RegisterDNResponse);
+  rpc CreateFile       (CreateFileRequest)      returns (CreateFileResponse);
+  rpc DeleteFile       (DeleteFileRequest)       returns (DeleteFileResponse);
+  rpc GetBlockInfo     (GetBlockInfoRequest)     returns (GetBlockInfoResponse);
+  rpc RegisterDataNode (RegisterDNRequest)       returns (RegisterDNResponse);
+
+  // Phase 2: Raft leader lifecycle notifications
+  // Called by a DataNode immediately after winning a Raft election.
+  rpc NotifyLeader   (NotifyLeaderRequest)   returns (NotifyLeaderResponse);
+  // Periodic heartbeat sent by the current Raft leader for each block.
+  rpc BlockHeartbeat (BlockHeartbeatRequest) returns (BlockHeartbeatResponse);
 }
 
 // ── File operations ────────────────────────────────────────────────────────
@@ -54,4 +60,27 @@ message RegisterDNRequest {
 message RegisterDNResponse {
   bool   ok    = 1;
   string error = 2;
+}
+
+// ── Raft leader notifications ──────────────────────────────────────────────
+
+message NotifyLeaderRequest {
+  string block_id   = 1;
+  string leader_id  = 2;  // datanode_id of the new leader
+  int64  term       = 3;
+}
+
+message NotifyLeaderResponse {
+  bool   ok    = 1;
+  string error = 2;
+}
+
+message BlockHeartbeatRequest {
+  string block_id   = 1;
+  string leader_id  = 2;  // datanode_id of the current leader
+  int64  term       = 3;
+}
+
+message BlockHeartbeatResponse {
+  bool ok = 1;
 }

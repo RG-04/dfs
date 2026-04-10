@@ -25,22 +25,26 @@ async def main() -> None:
         config = yaml.safe_load(fh)
 
     client = DFSClient(config)
-    for x in range(3):
+    for x in range(1):
         path = f"/example_{x}.bin"
         payload = b"hello dfs\n"
 
-        print(f"Creating {path}...")
-        await client.create(path)
+        # print(f"Creating {path}...")
+        # await client.create(path)
+
+        x = input(f"Press Enter to write to {path}...")
 
         print(f"Writing {len(payload)} bytes to {path}...")
-        await client.write(path, offset=0, data=payload)
+        await client.write(path, offset=2, data=payload)
+
+        x = input(f"Press Enter to read from {path}...")
 
         print(f"Reading back {len(payload)} bytes from {path}...")
         data = await client.read(path, offset=0, length=len(payload))
         print("Read bytes:", data)
 
-        print(f"Deleting {path}...")
-        await client.delete(path)
+        # print(f"Deleting {path}...")
+        # await client.delete(path)
     print("Done")
 
 

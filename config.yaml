@@ -1,10 +1,14 @@
-# DFS Phase-1 configuration
-#
-# block_size: bytes per block.  1 MiB is a reasonable test default;
-# production systems typically use 64–128 MiB.  Keep below the gRPC
-# message size limit configured in the code (128 MiB).
+# DFS Phase-2 configuration
 
 block_size: 1048576   # 1 MiB
+
+# Raft replication group size.  Every block is replicated across this many
+# DataNodes.  New block allocation is denied if fewer DataNodes are available.
+replication_factor: 3
+
+# Seconds of silence from a block's Raft leader before the Master marks
+# that block cluster as unavailable.  Resets on NotifyLeader.
+heartbeat_timeout: 15
 
 master:
   host: "127.0.0.1"

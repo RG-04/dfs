@@ -45,6 +45,7 @@ Usage::
 import logging
 from typing import List
 
+import grpc
 from grpc import aio
 
 from dfs.proto import master_pb2, master_pb2_grpc
@@ -141,6 +142,7 @@ class DFSClient:
 
             # --- 2. Ask MasterNode which DataNode owns this block ----------
             block_info = await self._get_block_info(path, block_index, write=False)
+            logger.info(f"block_info for {path} block[{block_index}]: {block_info}")
 
             # --- 3. Read from that DataNode --------------------------------
             chunk = await self._read_block(block_info, intra_block_offset, to_read)
@@ -186,15 +188,20 @@ class DFSClient:
         data: bytes,
     ) -> None:
         addr = f"{block.datanode_host}:{block.datanode_port}"
-        async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
-            stub = datanode_pb2_grpc.DataNodeStub(ch)
-            resp = await stub.WriteBlock(
-                datanode_pb2.WriteBlockRequest(
-                    block_id=block.block_id,
-                    intra_block_offset=intra_block_offset,
-                    data=data,
+        try:
+            async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
+                stub = datanode_pb2_grpc.DataNodeStub(ch)
+                resp = await stub.WriteBlock(
+                    datanode_pb2.WriteBlockRequest(
+                        block_id=block.block_id,
+                        intra_block_offset=intra_block_offset,
+                        data=data,
+                    )
                 )
-            )
+        except grpc.RpcError as exc:
+            raise DFSError(
+                f"WriteBlock({block.block_id!r}): transport error: {exc.details()}"
+            ) from exc
         if not resp.ok:
             raise DFSError(f"WriteBlock({block.block_id!r}): {resp.error}")
 
@@ -205,15 +212,20 @@ class DFSClient:
         length: int,
     ) -> bytes:
         addr = f"{block.datanode_host}:{block.datanode_port}"
-        async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
-            stub = datanode_pb2_grpc.DataNodeStub(ch)
-            resp = await stub.ReadBlock(
-                datanode_pb2.ReadBlockRequest(
-                    block_id=block.block_id,
-                    intra_block_offset=intra_block_offset,
-                    length=length,
+        try:
+            async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
+                stub = datanode_pb2_grpc.DataNodeStub(ch)
+                resp = await stub.ReadBlock(
+                    datanode_pb2.ReadBlockRequest(
+                        block_id=block.block_id,
+                        intra_block_offset=intra_block_offset,
+                        length=length,
+                    )
                 )
-            )
+        except grpc.RpcError as exc:
+            raise DFSError(
+                f"ReadBlock({block.block_id!r}): transport error: {exc.details()}"
+            ) from exc
         if not resp.ok:
             raise DFSError(f"ReadBlock({block.block_id!r}): {resp.error}")
         return resp.data
