@@ -40,7 +40,7 @@ _GRPC_OPTIONS = [
     ("grpc.max_receive_message_length", 128 * 1024 * 1024),
 ]
 
-_HEARTBEAT_INTERVAL = 10   # seconds — registration heartbeat to master
+_HEARTBEAT_INTERVAL_DEFAULT = 10   # seconds — registration heartbeat to master
 
 
 class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
@@ -386,6 +386,7 @@ async def _register_loop(
     dn_port: int,
     master_host: str,
     master_port: int,
+    heartbeat_interval: float,
 ) -> None:
     first = True
     while True:
@@ -412,11 +413,11 @@ async def _register_loop(
                 logger.warning("Registration rejected: %s", resp.error)
         except Exception as exc:
             logger.warning(
-                "Cannot reach Master (%s:%d): %s — retrying in %ds",
-                master_host, master_port, exc, _HEARTBEAT_INTERVAL,
+                "Cannot reach Master (%s:%d): %s — retrying in %.0fs",
+                master_host, master_port, exc, heartbeat_interval,
             )
 
-        await asyncio.sleep(_HEARTBEAT_INTERVAL)
+        await asyncio.sleep(heartbeat_interval)
 
 
 # ── Server bootstrap ───────────────────────────────────────────────────────
@@ -438,11 +439,14 @@ async def serve(dn_id: str, config: dict) -> None:
     # Re-create RaftNodes for blocks that survived a previous crash/restart.
     await servicer.startup()
 
-    master_host = config["master"]["host"]
-    master_port = config["master"]["port"]
+    master_host        = config["master"]["host"]
+    master_port        = config["master"]["port"]
+    heartbeat_interval = float(
+        config.get("dn_heartbeat_interval", _HEARTBEAT_INTERVAL_DEFAULT)
+    )
 
     asyncio.create_task(
-        _register_loop(dn_id, host, port, master_host, master_port)
+        _register_loop(dn_id, host, port, master_host, master_port, heartbeat_interval)
     )
 
     await server.wait_for_termination()

@@ -50,6 +50,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         self._block_size:        int = config["block_size"]
         self._replication_factor: int = config.get("replication_factor", 3)
         self._hb_timeout:        float = float(config.get("heartbeat_timeout", 15))
+        # How long since the last registration heartbeat before a DataNode is
+        # considered unreachable for new block allocation.  Defaults to the
+        # DataNode heartbeat interval (10 s) plus a generous margin.
+        self._dn_liveness_timeout: float = float(
+            config.get("dn_liveness_timeout", 30)
+        )
 
         # Metadata persistence
         meta_dir = Path(config["master"]["metadata_dir"])
@@ -62,7 +68,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         }
 
         # Runtime registration state
-        self._registered_dns: Dict[str, dict] = {}   # dn_id → {host, port}
+        self._registered_dns: Dict[str, dict] = {}   # dn_id → {host, port, last_seen}
         self._addr_to_dn:     Dict[str, str]  = {}   # "host:port" → dn_id
         self._ready  = asyncio.Event()
         self._lock   = asyncio.Lock()
@@ -78,6 +84,10 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         self._files: Dict[str, dict] = {}
         # Directory set — "/" is always present.
         self._dirs:  Set[str]        = {"/"}
+        # Persistent deletion queue.
+        # Each entry: {"block_id": str, "pending_peers": [dn_id, ...]}
+        # Survives master restarts; entries are removed once all peers confirm.
+        self._delete_queue: List[dict] = []
         self._load_metadata()
 
         # Per-block leader tracking (volatile — rebuilt from NotifyLeader /
@@ -85,24 +95,32 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         # block_id → {leader_id, term, last_hb, available}
         self._block_status: Dict[str, dict] = {}
 
+        # Signals the deletion loop that new work has been enqueued.
+        self._delete_event = asyncio.Event()
+
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _load_metadata(self) -> None:
         if self._meta_file.exists():
             with open(self._meta_file) as fh:
                 saved = json.load(fh)
-            self._files = saved.get("files", {})
-            self._dirs  = set(saved.get("dirs", ["/"])) | {"/"}
+            self._files        = saved.get("files", {})
+            self._dirs         = set(saved.get("dirs", ["/"])) | {"/"}
+            self._delete_queue = saved.get("delete_queue", [])
             logger.info(
-                "Loaded metadata: %d file(s), %d dir(s)",
-                len(self._files), len(self._dirs),
+                "Loaded metadata: %d file(s), %d dir(s), %d pending deletion(s)",
+                len(self._files), len(self._dirs), len(self._delete_queue),
             )
 
     def _save_metadata(self) -> None:
         tmp = self._meta_file.with_suffix(".tmp")
         with open(tmp, "w") as fh:
             json.dump(
-                {"files": self._files, "dirs": sorted(self._dirs)},
+                {
+                    "files":        self._files,
+                    "dirs":         sorted(self._dirs),
+                    "delete_queue": self._delete_queue,
+                },
                 fh, indent=2,
             )
         tmp.rename(self._meta_file)
@@ -150,14 +168,22 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             )
 
         async with self._lock:
+            now = time.monotonic()
+            is_new = dn_id not in self._registered_dns
             self._registered_dns[dn_id] = {
-                "host": request.host,
-                "port": request.port,
+                "host":      request.host,
+                "port":      request.port,
+                "last_seen": now,
             }
             self._addr_to_dn[f"{request.host}:{request.port}"] = dn_id
-            logger.info(
-                "DataNode %s registered (%s:%d)", dn_id, request.host, request.port
-            )
+            if is_new:
+                logger.info(
+                    "DataNode %s registered (%s:%d)", dn_id, request.host, request.port
+                )
+            else:
+                logger.debug(
+                    "DataNode %s heartbeat (%s:%d)", dn_id, request.host, request.port
+                )
             if set(self._registered_dns) >= set(self._expected_dns):
                 if not self._ready.is_set():
                     self._ready.set()
@@ -418,48 +444,108 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 "DeleteFile: %s (%d block(s))", path, len(file_meta["blocks"])
             )
 
-        asyncio.create_task(self._delete_blocks_bg(file_meta["blocks"]))
+        # Enqueue deletions for all blocks durably, then signal the retry loop.
+        async with self._lock:
+            for blk in file_meta["blocks"]:
+                block_id = blk["block_id"]
+                peers    = [p for p in blk.get("peers", [blk.get("datanode_id")]) if p]
+                self._block_status.pop(block_id, None)
+                self._delete_queue.append({
+                    "block_id":      block_id,
+                    "pending_peers": list(peers),
+                })
+            self._save_metadata()
+
+        self._delete_event.set()
         return master_pb2.DeleteFileResponse(ok=True)
 
-    async def _delete_blocks_bg(self, blocks: list) -> None:
-        """Delete a block from every member of its Raft group."""
-        for blk in blocks:
-            block_id = blk["block_id"]
-            peers    = blk.get("peers", [blk.get("datanode_id")])
+    async def _deletion_loop(self) -> None:
+        """Background loop that drains the persistent deletion queue.
+
+        Retries pending DeleteBlock RPCs with exponential backoff.  An entry
+        is removed from the queue only after every peer confirms deletion.
+        Survives master restarts because the queue is persisted to disk.
+        """
+        _MAX_BACKOFF = 60.0
+        backoff = 2.0
+
+        while True:
+            # Wait until there is work or until the backoff expires.
+            try:
+                await asyncio.wait_for(self._delete_event.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            self._delete_event.clear()
 
             async with self._lock:
-                # Remove leader tracking.
-                self._block_status.pop(block_id, None)
+                if not self._delete_queue:
+                    backoff = 2.0
+                    continue
+                # Snapshot the queue so we can release the lock during RPCs.
+                snapshot = [dict(e) for e in self._delete_queue]
 
-            for dn_id in peers:
-                if dn_id is None:
-                    continue
-                dn_info = self._registered_dns.get(dn_id)
-                if not dn_info:
-                    logger.warning(
-                        "Cannot delete block %s from %s — not registered",
-                        block_id, dn_id,
-                    )
-                    continue
-                try:
-                    async with aio.insecure_channel(
-                        f"{dn_info['host']}:{dn_info['port']}",
-                        options=_GRPC_OPTIONS,
-                    ) as ch:
-                        stub = datanode_pb2_grpc.DataNodeStub(ch)
-                        resp = await stub.DeleteBlock(
-                            datanode_pb2.DeleteBlockRequest(block_id=block_id)
+            any_failure = False
+            for entry in snapshot:
+                block_id      = entry["block_id"]
+                still_pending = list(entry["pending_peers"])
+
+                for dn_id in list(still_pending):
+                    dn_info = self._registered_dns.get(dn_id)
+                    if not dn_info:
+                        logger.debug(
+                            "deletion[%.8s]: %s not registered yet — will retry",
+                            block_id, dn_id,
                         )
-                        if not resp.ok:
+                        any_failure = True
+                        continue
+                    try:
+                        async with aio.insecure_channel(
+                            f"{dn_info['host']}:{dn_info['port']}",
+                            options=_GRPC_OPTIONS,
+                        ) as ch:
+                            stub = datanode_pb2_grpc.DataNodeStub(ch)
+                            resp = await stub.DeleteBlock(
+                                datanode_pb2.DeleteBlockRequest(block_id=block_id)
+                            )
+                        if resp.ok:
+                            still_pending.remove(dn_id)
+                            logger.info(
+                                "deletion[%.8s]: confirmed on %s", block_id, dn_id
+                            )
+                        else:
                             logger.warning(
-                                "DeleteBlock %s on %s failed: %s",
+                                "deletion[%.8s]: %s rejected: %s",
                                 block_id, dn_id, resp.error,
                             )
-                except Exception as exc:
-                    logger.warning(
-                        "Error deleting block %s from %s: %s",
-                        block_id, dn_id, exc,
-                    )
+                            any_failure = True
+                    except Exception as exc:
+                        logger.warning(
+                            "deletion[%.8s]: cannot reach %s: %s — will retry",
+                            block_id, dn_id, exc,
+                        )
+                        any_failure = True
+
+                entry["pending_peers"] = still_pending
+
+            # Write updated queue back; drop fully-confirmed entries.
+            async with self._lock:
+                # Merge results back: update pending_peers in the live queue.
+                by_id = {e["block_id"]: e for e in snapshot}
+                self._delete_queue = [
+                    {**q, "pending_peers": by_id[q["block_id"]]["pending_peers"]}
+                    if q["block_id"] in by_id else q
+                    for q in self._delete_queue
+                ]
+                before = len(self._delete_queue)
+                self._delete_queue = [
+                    e for e in self._delete_queue if e["pending_peers"]
+                ]
+                completed = before - len(self._delete_queue)
+                if completed:
+                    logger.info("deletion loop: %d block(s) fully deleted", completed)
+                self._save_metadata()
+
+            backoff = min(_MAX_BACKOFF, backoff * 2) if any_failure else 2.0
 
     # ── Block routing ──────────────────────────────────────────────────────
 
@@ -600,8 +686,20 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
     # ── Block allocation helpers ───────────────────────────────────────────
 
     def _available_dns(self) -> List[str]:
-        """Return IDs of currently registered DataNodes."""
-        return sorted(self._registered_dns)
+        """Return IDs of DataNodes that have sent a heartbeat recently enough
+        to be considered alive for new block allocation."""
+        cutoff = time.monotonic() - self._dn_liveness_timeout
+        live   = []
+        for dn_id, info in self._registered_dns.items():
+            last_seen = info.get("last_seen", 0)
+            if last_seen >= cutoff:
+                live.append(dn_id)
+            else:
+                logger.debug(
+                    "DataNode %s excluded from allocation (last seen %.1fs ago)",
+                    dn_id, time.monotonic() - last_seen,
+                )
+        return sorted(live)
 
     def _pick_group(self, avail: List[str], size: int) -> List[str]:
         """Pick *size* DataNodes using round-robin, return as ordered list."""
@@ -688,7 +786,14 @@ async def serve(config: dict) -> None:
     await server.start()
     logger.info("MasterNode listening on %s:%d", host, port)
 
-    # Start the heartbeat watchdog.
+    # Start background tasks.
     asyncio.create_task(servicer._heartbeat_watchdog())
+    asyncio.create_task(servicer._deletion_loop())
+    if servicer._delete_queue:
+        logger.info(
+            "Resuming %d pending block deletion(s) from previous run",
+            len(servicer._delete_queue),
+        )
+        servicer._delete_event.set()
 
     await server.wait_for_termination()

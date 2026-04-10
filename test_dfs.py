@@ -79,6 +79,56 @@ def live_cluster(cluster_config):
         p.wait(timeout=5)
 
 
+def _start_cluster(config: dict, procs: dict, data_dirs_exist: bool = False) -> None:
+    """Start master + all datanodes described by *config* into *procs*.
+
+    If *data_dirs_exist* is False the data directories are wiped first.
+    Writes a temporary config file so the processes pick up the right values.
+    Returns the path to the temp config file (caller must clean up).
+    """
+    import shutil, tempfile
+
+    master_cfg = config["master"]
+    dn_cfgs    = config["datanodes"]
+
+    if not data_dirs_exist:
+        for d in [master_cfg["metadata_dir"]] + [dn["data_dir"] for dn in dn_cfgs]:
+            shutil.rmtree(d, ignore_errors=True)
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+    # Write config to a temp file so subprocesses see the overridden values.
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, prefix="dfs_test_cfg_"
+    )
+    import yaml as _yaml
+    _yaml.dump(config, tmp)
+    tmp.flush()
+    cfg_path = tmp.name
+    tmp.close()
+
+    procs["master"] = subprocess.Popen(
+        [_PYTHON, str(_ROOT / "bin" / "master.py"), cfg_path],
+    )
+    time.sleep(0.5)
+    for dn in dn_cfgs:
+        procs[dn["id"]] = subprocess.Popen(
+            [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn["id"], cfg_path],
+        )
+    _wait_ready(config)
+    return cfg_path
+
+
+def _stop_cluster(procs: dict) -> None:
+    for p in procs.values():
+        if p.poll() is None:
+            p.terminate()
+    for p in procs.values():
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
 def _evict_old_nodes(config: dict) -> None:
     import socket
 
@@ -141,7 +191,12 @@ async def _ensure_dir(config: dict, path: str) -> None:
         pass  # already exists — that's fine
 
 
-def _restart_datanode(dn_id: str, config: dict, procs: dict) -> None:
+def _restart_datanode(
+    dn_id: str,
+    config: dict,
+    procs: dict,
+    config_path: str = _CONFIG_PATH,
+) -> None:
     """Kill the given DataNode process and restart it, updating *procs*."""
     old = procs.get(dn_id)
     if old and old.poll() is None:
@@ -162,7 +217,7 @@ def _restart_datanode(dn_id: str, config: dict, procs: dict) -> None:
         time.sleep(0.2)
 
     procs[dn_id] = subprocess.Popen(
-        [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn_id, _CONFIG_PATH],
+        [_PYTHON, str(_ROOT / "bin" / "datanode.py"), dn_id, config_path],
     )
     time.sleep(1.0)   # give it a moment to register
 
@@ -689,6 +744,256 @@ class TestFailureDetection:
                 await client.delete(path)
             except DFSError:
                 pass
+
+
+# ── Block deletion tests ──────────────────────────────────────────────────
+
+class TestBlockDeletion:
+    """Verify that block deletion is reliable: confirmed on all peers even
+    when a DataNode is temporarily unavailable at delete time."""
+
+    async def test_delete_removes_block_files_from_all_nodes(
+        self, dfs_client, cluster_config
+    ):
+        """After a normal delete, the block file must be gone from every
+        DataNode's data directory."""
+        import json
+
+        path = "/test/del_cleanup.bin"
+        try:
+            await dfs_client.delete(path)
+        except DFSError:
+            pass
+        await dfs_client.create(path)
+        await dfs_client.write(path, offset=0, data=b"Z" * 512)
+
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        block_id = meta["files"][path]["blocks"][0]["block_id"]
+
+        await dfs_client.delete(path)
+
+        # Give the deletion loop time to confirm on all peers.
+        await asyncio.sleep(1.0)
+
+        for dn in cluster_config["datanodes"]:
+            block_file = Path(dn["data_dir"]) / block_id
+            assert not block_file.exists(), (
+                f"Block {block_id[:8]} still present on {dn['id']} after delete"
+            )
+
+    async def test_delete_queue_persists_and_retries_after_node_recovers(
+        self, cluster_config, live_cluster
+    ):
+        """Kill one DataNode, delete a file, then restart the node.
+        The deletion loop must eventually deliver the DeleteBlock RPC to the
+        recovered node and remove the block file from its disk."""
+        import json
+
+        client = DFSClient(cluster_config)
+        path   = "/test/del_retry.bin"
+        try:
+            await client.delete(path)
+        except DFSError:
+            pass
+        await client.create(path)
+        await client.write(path, offset=0, data=b"R" * 512)
+
+        # Find the block and pick a peer that is NOT the leader to kill — so
+        # Raft can still commit the write but one peer will be offline at delete.
+        meta_file = Path(cluster_config["master"]["metadata_dir"]) / "metadata.json"
+        with open(meta_file) as fh:
+            meta = json.load(fh)
+        blk       = meta["files"][path]["blocks"][0]
+        block_id  = blk["block_id"]
+        leader_id = blk["leader_id"]
+        peers     = blk["peers"]
+        offline    = next(p for p in peers if p != leader_id)
+        dn_info    = next(dn for dn in cluster_config["datanodes"] if dn["id"] == offline)
+        block_file = Path(dn_info["data_dir"]) / block_id
+
+        # Wait for the follower's apply loop to write the block to disk before
+        # killing it — otherwise the block file wouldn't be there to check.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if block_file.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert block_file.exists(), (
+            f"Block never appeared on {offline} — follower didn't apply in time"
+        )
+
+        # Kill the offline node before deleting.
+        proc = live_cluster.get(offline)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        # Delete the file.  The deletion loop will queue the offline peer.
+        await client.delete(path)
+        await asyncio.sleep(0.5)
+        assert block_file.exists(), (
+            f"Block file already gone before node restarted — "
+            "test precondition failed"
+        )
+
+        # Verify the deletion queue has the pending entry persisted.
+        with open(meta_file) as fh:
+            meta_after = json.load(fh)
+        pending = [
+            e for e in meta_after.get("delete_queue", [])
+            if e["block_id"] == block_id
+        ]
+        assert pending, "Pending deletion not found in persisted delete_queue"
+        assert offline in pending[0]["pending_peers"], (
+            f"{offline} not in pending_peers: {pending[0]['pending_peers']}"
+        )
+
+        # Restart the node — the deletion loop will retry and clean up.
+        _restart_datanode(offline, cluster_config, live_cluster)
+
+        # Wait for the retry to land (initial backoff is 2 s, plus restart delay).
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if not block_file.exists():
+                break
+            await asyncio.sleep(0.5)
+
+        assert not block_file.exists(), (
+            f"Block {block_id[:8]} still on {offline} after node recovered — "
+            "deletion retry loop did not deliver"
+        )
+
+        # Confirm the queue entry is cleared from disk too.
+        with open(meta_file) as fh:
+            meta_final = json.load(fh)
+        remaining = [
+            e for e in meta_final.get("delete_queue", [])
+            if e["block_id"] == block_id
+        ]
+        assert not remaining, (
+            f"Delete queue entry for {block_id[:8]} not cleared after delivery"
+        )
+
+
+# ── DataNode liveness filter tests ───────────────────────────────────────
+
+class TestDNLiveness:
+    """Verify that dead-but-registered DataNodes are excluded from new block
+    allocation once dn_liveness_timeout has elapsed.
+
+    Uses its own short-lived cluster with tight timing so the test completes
+    in well under 30 s.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def fast_cluster(self, cluster_config, tmp_path):
+        """Spin up a cluster with dn_heartbeat_interval=2 and
+        dn_liveness_timeout=6 so liveness expires quickly."""
+        import copy, os
+
+        cfg = copy.deepcopy(cluster_config)
+        cfg["dn_heartbeat_interval"] = 2   # DataNodes heartbeat every 2 s
+        cfg["dn_liveness_timeout"]   = 6   # declared dead after 6 s silence
+
+        # Use separate data directories so we don't stomp on the main cluster.
+        cfg["master"]["metadata_dir"] = str(tmp_path / "master")
+        for dn in cfg["datanodes"]:
+            dn["data_dir"] = str(tmp_path / dn["id"])
+
+        # Use different ports to avoid clashing with the main live_cluster.
+        cfg["master"]["port"] = 50151
+        port_map = {"dn0": 50152, "dn1": 50153, "dn2": 50154}
+        for dn in cfg["datanodes"]:
+            dn["port"] = port_map[dn["id"]]
+
+        self._cfg      = cfg
+        self._procs    = {}
+        self._cfg_file = _start_cluster(cfg, self._procs)
+
+        await _ensure_dir(cfg, "/test")
+
+        yield
+
+        _stop_cluster(self._procs)
+        try:
+            os.unlink(self._cfg_file)
+        except OSError:
+            pass
+
+    async def test_live_node_included_in_allocation(self):
+        """Sanity: all three nodes alive → block allocation succeeds."""
+        client = DFSClient(self._cfg)
+        path   = "/test/liveness_ok.bin"
+        await client.create(path)
+        await client.write(path, offset=0, data=b"ok")
+        result = await client.read(path, offset=0, length=2)
+        assert result == b"ok"
+        await client.delete(path)
+
+    async def test_dead_node_excluded_after_liveness_timeout(self):
+        """Kill 2 DataNodes, wait for dn_liveness_timeout to expire, then try
+        to allocate a new block.  The master must refuse because only 1 live
+        node remains and replication_factor=3."""
+        client  = DFSClient(self._cfg)
+        dn_ids  = [dn["id"] for dn in self._cfg["datanodes"]]
+        to_kill = dn_ids[:2]
+
+        # Kill two nodes.
+        for dn_id in to_kill:
+            proc = self._procs.get(dn_id)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+        # Wait for liveness_timeout + one extra heartbeat window so the master
+        # has definitely not seen a heartbeat from the dead nodes.
+        liveness = self._cfg["dn_liveness_timeout"]
+        hb       = self._cfg["dn_heartbeat_interval"]
+        await asyncio.sleep(liveness + hb + 1.0)
+
+        path = "/test/liveness_dead.bin"
+        await client.create(path)
+        try:
+            with pytest.raises(DFSError, match="[Cc]annot allocate|only .* DataNode"):
+                await client.write(path, offset=0, data=b"X")
+        finally:
+            try:
+                await client.delete(path)
+            except DFSError:
+                pass
+            # Restart the killed nodes for cleanup.
+            for dn_id in to_kill:
+                _restart_datanode(dn_id, self._cfg, self._procs, self._cfg_file)
+
+    async def test_reregistration_restores_liveness(self):
+        """A node that was briefly unreachable but comes back and re-registers
+        must be included in allocation again."""
+        dn_id  = self._cfg["datanodes"][0]["id"]
+        client = DFSClient(self._cfg)
+
+        # Kill the node and let liveness expire.
+        proc = self._procs.get(dn_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        liveness = self._cfg["dn_liveness_timeout"]
+        hb       = self._cfg["dn_heartbeat_interval"]
+        await asyncio.sleep(liveness + hb + 1.0)
+
+        # Restart it — after one heartbeat it should be live again.
+        _restart_datanode(dn_id, self._cfg, self._procs, self._cfg_file)
+        await asyncio.sleep(hb + 1.0)   # give it time to heartbeat
+
+        # All 3 nodes live again — allocation must succeed.
+        path = "/test/liveness_restored.bin"
+        await client.create(path)
+        await client.write(path, offset=0, data=b"restored")
+        result = await client.read(path, offset=0, length=8)
+        assert result == b"restored"
+        await client.delete(path)
 
 
 # ── Term guard tests ──────────────────────────────────────────────────────

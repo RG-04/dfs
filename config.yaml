@@ -10,6 +10,14 @@ replication_factor: 3
 # that block cluster as unavailable.  Resets on NotifyLeader.
 heartbeat_timeout: 15
 
+# How often DataNodes send registration heartbeats to the Master (seconds).
+dn_heartbeat_interval: 10
+
+# Seconds since the last registration heartbeat before a DataNode is
+# considered unreachable for new block allocation.  Should be at least
+# 2 × dn_heartbeat_interval to tolerate one missed heartbeat.
+dn_liveness_timeout: 30
+
 master:
   host: "127.0.0.1"
   port: 50051
