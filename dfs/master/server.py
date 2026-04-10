@@ -1,27 +1,35 @@
-"""MasterNode gRPC server — Phase 2 (Raft-aware).
+"""MasterNode gRPC server — Phase 2 (Raft-aware, directory namespace).
 
-Changes from Phase 1
---------------------
-* Block metadata now stores the full Raft-group peer list plus the current
-  leader DataNode ID instead of a single `datanode_id`.
-* `GetBlockInfo` for WRITE allocates `replication_factor` DataNodes and calls
-  `RegisterBlock` on ALL of them (one is designated initial leader).
-* `GetBlockInfo` routes both reads and writes to the *current* Raft leader.
-* New RPCs `NotifyLeader` and `BlockHeartbeat` let DataNodes inform the
-  Master about leadership changes and keep it updated.
-* A background task marks a block's Raft cluster as unavailable when no
-  heartbeat is received from the leader within `heartbeat_timeout` seconds.
-* New block allocation is denied when fewer than `replication_factor`
+Namespace model
+---------------
+* The root directory ``/`` always exists and cannot be removed.
+* Files may only be created inside an existing directory.
+* Directories must be created explicitly with ``Mkdir`` before use.
+* ``Rmdir`` fails if the directory still contains files or subdirectories.
+* ``Stat`` and ``ListDir`` work on both files and directories.
+
+Raft integration
+----------------
+* Block metadata stores the full Raft-group peer list plus the current leader.
+* ``GetBlockInfo`` allocates ``replication_factor`` DataNodes and calls
+  ``RegisterBlock`` on ALL of them (one is designated initial leader).
+* ``GetBlockInfo`` routes both reads and writes to the *current* Raft leader.
+* ``NotifyLeader`` and ``BlockHeartbeat`` let DataNodes keep the Master
+  informed about leadership changes.
+* A background watchdog marks blocks unavailable after ``heartbeat_timeout``
+  seconds of silence from the leader.
+* New block allocation is denied when fewer than ``replication_factor``
   DataNodes are currently registered.
 """
 
 import asyncio
 import json
 import logging
+import posixpath
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import grpc
 from grpc import aio
@@ -68,6 +76,8 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         #    "peers":    [dn_id, ...],   # all group members
         #    "leader_id": str}           # current leader's dn_id
         self._files: Dict[str, dict] = {}
+        # Directory set — "/" is always present.
+        self._dirs:  Set[str]        = {"/"}
         self._load_metadata()
 
         # Per-block leader tracking (volatile — rebuilt from NotifyLeader /
@@ -82,13 +92,32 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             with open(self._meta_file) as fh:
                 saved = json.load(fh)
             self._files = saved.get("files", {})
-            logger.info("Loaded metadata: %d file(s)", len(self._files))
+            self._dirs  = set(saved.get("dirs", ["/"])) | {"/"}
+            logger.info(
+                "Loaded metadata: %d file(s), %d dir(s)",
+                len(self._files), len(self._dirs),
+            )
 
     def _save_metadata(self) -> None:
         tmp = self._meta_file.with_suffix(".tmp")
         with open(tmp, "w") as fh:
-            json.dump({"files": self._files}, fh, indent=2)
+            json.dump(
+                {"files": self._files, "dirs": sorted(self._dirs)},
+                fh, indent=2,
+            )
         tmp.rename(self._meta_file)
+
+    # ── Path helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parent(path: str) -> str:
+        """Return the parent directory of *path* using POSIX semantics."""
+        parent = posixpath.dirname(path.rstrip("/"))
+        return parent or "/"
+
+    @staticmethod
+    def _basename(path: str) -> str:
+        return posixpath.basename(path.rstrip("/")) or "/"
 
     # ── Readiness gate ─────────────────────────────────────────────────────
 
@@ -205,10 +234,169 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 return master_pb2.CreateFileResponse(
                     ok=False, error=f"File already exists: {path}"
                 )
+            if path in self._dirs:
+                return master_pb2.CreateFileResponse(
+                    ok=False, error=f"Path is a directory: {path}"
+                )
+            parent = self._parent(path)
+            if parent not in self._dirs:
+                return master_pb2.CreateFileResponse(
+                    ok=False,
+                    error=f"Parent directory does not exist: {parent}",
+                )
             self._files[path] = {"blocks": []}
             self._save_metadata()
             logger.info("CreateFile: %s", path)
             return master_pb2.CreateFileResponse(ok=True)
+
+    # ── Directory operations ───────────────────────────────────────────────
+
+    async def Mkdir(
+        self,
+        request: master_pb2.MkdirRequest,
+        context,
+    ) -> master_pb2.MkdirResponse:
+        if not await self._assert_ready(context):
+            return master_pb2.MkdirResponse(ok=False, error="Master not ready")
+
+        async with self._lock:
+            path = request.path.rstrip("/") or "/"
+            if path == "/":
+                return master_pb2.MkdirResponse(ok=False, error="Root already exists")
+            if path in self._dirs:
+                return master_pb2.MkdirResponse(
+                    ok=False, error=f"Directory already exists: {path}"
+                )
+            if path in self._files:
+                return master_pb2.MkdirResponse(
+                    ok=False, error=f"Path is a file: {path}"
+                )
+            parent = self._parent(path)
+            if parent not in self._dirs:
+                return master_pb2.MkdirResponse(
+                    ok=False,
+                    error=f"Parent directory does not exist: {parent}",
+                )
+            self._dirs.add(path)
+            self._save_metadata()
+            logger.info("Mkdir: %s", path)
+            return master_pb2.MkdirResponse(ok=True)
+
+    async def Rmdir(
+        self,
+        request: master_pb2.RmdirRequest,
+        context,
+    ) -> master_pb2.RmdirResponse:
+        if not await self._assert_ready(context):
+            return master_pb2.RmdirResponse(ok=False, error="Master not ready")
+
+        async with self._lock:
+            path = request.path.rstrip("/") or "/"
+            if path == "/":
+                return master_pb2.RmdirResponse(ok=False, error="Cannot remove root")
+            if path not in self._dirs:
+                if path in self._files:
+                    return master_pb2.RmdirResponse(
+                        ok=False, error=f"Not a directory: {path}"
+                    )
+                return master_pb2.RmdirResponse(
+                    ok=False, error=f"Directory not found: {path}"
+                )
+            # Fail if any file lives directly inside this directory.
+            prefix = path + "/"
+            for fpath in self._files:
+                if fpath.startswith(prefix):
+                    return master_pb2.RmdirResponse(
+                        ok=False, error=f"Directory not empty: {path}"
+                    )
+            # Fail if any subdirectory lives directly inside.
+            for dpath in self._dirs:
+                if dpath != path and dpath.startswith(prefix):
+                    return master_pb2.RmdirResponse(
+                        ok=False, error=f"Directory not empty: {path}"
+                    )
+            self._dirs.discard(path)
+            self._save_metadata()
+            logger.info("Rmdir: %s", path)
+            return master_pb2.RmdirResponse(ok=True)
+
+    async def Stat(
+        self,
+        request: master_pb2.StatRequest,
+        context,
+    ) -> master_pb2.StatResponse:
+        if not await self._assert_ready(context):
+            return master_pb2.StatResponse(ok=False, error="Master not ready")
+
+        async with self._lock:
+            path = request.path
+            name = self._basename(path)
+            if path in self._dirs or path.rstrip("/") == "":
+                return master_pb2.StatResponse(
+                    ok=True,
+                    entry=master_pb2.StatEntry(
+                        type=master_pb2.StatEntry.DIR,
+                        name=name,
+                        num_blocks=0,
+                    ),
+                )
+            if path in self._files:
+                num_blocks = len(self._files[path]["blocks"])
+                return master_pb2.StatResponse(
+                    ok=True,
+                    entry=master_pb2.StatEntry(
+                        type=master_pb2.StatEntry.FILE,
+                        name=name,
+                        num_blocks=num_blocks,
+                    ),
+                )
+            return master_pb2.StatResponse(
+                ok=False, error=f"No such file or directory: {path}"
+            )
+
+    async def ListDir(
+        self,
+        request: master_pb2.ListDirRequest,
+        context,
+    ) -> master_pb2.ListDirResponse:
+        if not await self._assert_ready(context):
+            return master_pb2.ListDirResponse(ok=False, error="Master not ready")
+
+        async with self._lock:
+            path = request.path.rstrip("/") or "/"
+            if path not in self._dirs:
+                if path in self._files:
+                    return master_pb2.ListDirResponse(
+                        ok=False, error=f"Not a directory: {path}"
+                    )
+                return master_pb2.ListDirResponse(
+                    ok=False, error=f"Directory not found: {path}"
+                )
+
+            entries: List[master_pb2.StatEntry] = []
+
+            # Immediate subdirectories
+            for dpath in sorted(self._dirs):
+                if dpath == path:
+                    continue
+                parent = self._parent(dpath)
+                if parent == path:
+                    entries.append(master_pb2.StatEntry(
+                        type=master_pb2.StatEntry.DIR,
+                        name=self._basename(dpath),
+                        num_blocks=0,
+                    ))
+
+            # Immediate files
+            for fpath in sorted(self._files):
+                if self._parent(fpath) == path:
+                    entries.append(master_pb2.StatEntry(
+                        type=master_pb2.StatEntry.FILE,
+                        name=self._basename(fpath),
+                        num_blocks=len(self._files[fpath]["blocks"]),
+                    ))
+
+            return master_pb2.ListDirResponse(ok=True, entries=entries)
 
     async def DeleteFile(
         self,

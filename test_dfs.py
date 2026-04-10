@@ -27,6 +27,7 @@ from dfs.proto import master_pb2, master_pb2_grpc
 _ROOT        = Path(__file__).parent
 _CONFIG_PATH = str(_ROOT / "config.yaml")
 _PYTHON      = sys.executable
+_TEST_DIR    = "/test"
 _TEST_PATH   = "/test/integration.bin"
 
 # ── Session fixtures: cluster lifecycle ───────────────────────────────────
@@ -63,6 +64,9 @@ def live_cluster(cluster_config):
         )
 
     _wait_ready(cluster_config)
+
+    # Create the shared test directory used by all integration tests.
+    asyncio.run(_ensure_dir(cluster_config, _TEST_DIR))
 
     yield procs   # expose proc dict so failure tests can kill individual nodes
 
@@ -124,6 +128,15 @@ def _wait_ready(config: dict, timeout: float = 30.0) -> None:
         time.sleep(0.3)
 
     raise RuntimeError(f"Cluster not ready after {timeout}s: {last_exc}")
+
+
+async def _ensure_dir(config: dict, path: str) -> None:
+    """Create *path* if it does not already exist (ignores 'already exists')."""
+    client = DFSClient(config)
+    try:
+        await client.mkdir(path)
+    except DFSError:
+        pass  # already exists — that's fine
 
 
 def _restart_datanode(dn_id: str, config: dict, procs: dict) -> None:
@@ -305,6 +318,119 @@ class TestDelete:
 
         with pytest.raises(DFSError, match="not found|File not found"):
             await dfs_client.delete(path)
+
+
+# ── Namespace tests ───────────────────────────────────────────────────────
+
+class TestNamespace:
+    """Tests for directory operations: mkdir, rmdir, stat, ls, and the rule
+    that files must live inside an existing directory."""
+
+    async def test_mkdir_and_rmdir(self, dfs_client):
+        await dfs_client.mkdir("/ns_test_dir")
+        # Verify it appears in root listing.
+        entries = await dfs_client.ls("/")
+        names = [e.name for e in entries]
+        assert "ns_test_dir" in names
+        # Remove it.
+        await dfs_client.rmdir("/ns_test_dir")
+        entries = await dfs_client.ls("/")
+        assert "ns_test_dir" not in [e.name for e in entries]
+
+    async def test_duplicate_mkdir_raises(self, dfs_client):
+        await dfs_client.mkdir("/dup_dir")
+        try:
+            with pytest.raises(DFSError, match="already exists"):
+                await dfs_client.mkdir("/dup_dir")
+        finally:
+            await dfs_client.rmdir("/dup_dir")
+
+    async def test_mkdir_missing_parent_raises(self, dfs_client):
+        with pytest.raises(DFSError, match="[Pp]arent"):
+            await dfs_client.mkdir("/no_such_parent/child")
+
+    async def test_rmdir_non_empty_raises(self, dfs_client):
+        await dfs_client.mkdir("/nonempty_dir")
+        await dfs_client.create("/nonempty_dir/file.bin")
+        try:
+            with pytest.raises(DFSError, match="[Nn]ot empty"):
+                await dfs_client.rmdir("/nonempty_dir")
+        finally:
+            await dfs_client.delete("/nonempty_dir/file.bin")
+            await dfs_client.rmdir("/nonempty_dir")
+
+    async def test_rmdir_missing_raises(self, dfs_client):
+        with pytest.raises(DFSError, match="[Nn]ot found"):
+            await dfs_client.rmdir("/does_not_exist_xyz")
+
+    async def test_create_file_without_parent_raises(self, dfs_client):
+        with pytest.raises(DFSError, match="[Pp]arent"):
+            await dfs_client.create("/no_such_dir/file.bin")
+
+    async def test_stat_directory(self, dfs_client):
+        await dfs_client.mkdir("/stat_dir")
+        try:
+            result = await dfs_client.stat("/stat_dir")
+            assert result.type == "dir"
+            assert result.name == "stat_dir"
+        finally:
+            await dfs_client.rmdir("/stat_dir")
+
+    async def test_stat_file(self, dfs_client, block_size):
+        await dfs_client.mkdir("/stat_file_dir")
+        await dfs_client.create("/stat_file_dir/f.bin")
+        try:
+            result = await dfs_client.stat("/stat_file_dir/f.bin")
+            assert result.type == "file"
+            assert result.name == "f.bin"
+            assert result.num_blocks == 0  # no data written yet
+        finally:
+            await dfs_client.delete("/stat_file_dir/f.bin")
+            await dfs_client.rmdir("/stat_file_dir")
+
+    async def test_stat_file_with_blocks(self, dfs_client, block_size):
+        await dfs_client.mkdir("/stat_blocks_dir")
+        await dfs_client.create("/stat_blocks_dir/big.bin")
+        try:
+            await dfs_client.write("/stat_blocks_dir/big.bin", offset=0, data=b"x" * block_size)
+            result = await dfs_client.stat("/stat_blocks_dir/big.bin")
+            assert result.type == "file"
+            assert result.num_blocks == 1
+        finally:
+            await dfs_client.delete("/stat_blocks_dir/big.bin")
+            await dfs_client.rmdir("/stat_blocks_dir")
+
+    async def test_stat_missing_raises(self, dfs_client):
+        with pytest.raises(DFSError, match="[Nn]o such"):
+            await dfs_client.stat("/definitely_not_there_xyz")
+
+    async def test_ls_root(self, dfs_client):
+        """Root listing must at least include the /test directory created at startup."""
+        entries = await dfs_client.ls("/")
+        names = [e.name for e in entries]
+        assert "test" in names
+
+    async def test_ls_shows_files_and_dirs(self, dfs_client):
+        await dfs_client.mkdir("/ls_test")
+        await dfs_client.mkdir("/ls_test/subdir")
+        await dfs_client.create("/ls_test/file.bin")
+        try:
+            entries = await dfs_client.ls("/ls_test")
+            by_name = {e.name: e for e in entries}
+            assert "subdir" in by_name and by_name["subdir"].type == "dir"
+            assert "file.bin" in by_name and by_name["file.bin"].type == "file"
+        finally:
+            await dfs_client.delete("/ls_test/file.bin")
+            await dfs_client.rmdir("/ls_test/subdir")
+            await dfs_client.rmdir("/ls_test")
+
+    async def test_ls_missing_raises(self, dfs_client):
+        with pytest.raises(DFSError, match="[Nn]ot found"):
+            await dfs_client.ls("/no_such_dir_xyz")
+
+    async def test_stat_root(self, dfs_client):
+        result = await dfs_client.stat("/")
+        assert result.type == "dir"
 
 
 # ── Phase-2 tests: replication and failure ────────────────────────────────

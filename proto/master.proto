@@ -3,12 +3,27 @@ syntax = "proto3";
 package dfs;
 
 service MasterNode {
-  rpc CreateFile       (CreateFileRequest)      returns (CreateFileResponse);
-  rpc DeleteFile       (DeleteFileRequest)       returns (DeleteFileResponse);
+  // ── File operations ──────────────────────────────────────────────────────
+  rpc CreateFile (CreateFileRequest) returns (CreateFileResponse);
+  rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+
+  // ── Directory operations ──────────────────────────────────────────────────
+  // Create a directory.  Parent must already exist.
+  rpc Mkdir   (MkdirRequest)   returns (MkdirResponse);
+  // Remove an empty directory.  Fails if it contains files or subdirectories.
+  rpc Rmdir   (RmdirRequest)   returns (RmdirResponse);
+  // Stat a path (file or directory).
+  rpc Stat    (StatRequest)    returns (StatResponse);
+  // List the immediate children of a directory.
+  rpc ListDir (ListDirRequest) returns (ListDirResponse);
+
+  // ── Block routing ─────────────────────────────────────────────────────────
   rpc GetBlockInfo     (GetBlockInfoRequest)     returns (GetBlockInfoResponse);
+
+  // ── DataNode registration ─────────────────────────────────────────────────
   rpc RegisterDataNode (RegisterDNRequest)       returns (RegisterDNResponse);
 
-  // Phase 2: Raft leader lifecycle notifications
+  // ── Raft leader lifecycle notifications ──────────────────────────────────
   // Called by a DataNode immediately after winning a Raft election.
   rpc NotifyLeader   (NotifyLeaderRequest)   returns (NotifyLeaderResponse);
   // Periodic heartbeat sent by the current Raft leader for each block.
@@ -22,6 +37,32 @@ message CreateFileResponse { bool ok = 1; string error = 2; }
 
 message DeleteFileRequest  { string path = 1; }
 message DeleteFileResponse { bool ok = 1; string error = 2; }
+
+// ── Directory operations ───────────────────────────────────────────────────
+
+message MkdirRequest  { string path = 1; }
+message MkdirResponse { bool ok = 1; string error = 2; }
+
+message RmdirRequest  { string path = 1; }
+message RmdirResponse { bool ok = 1; string error = 2; }
+
+// StatEntry describes either a file or a directory.
+message StatEntry {
+  enum Type { FILE = 0; DIR = 1; }
+  Type   type       = 1;
+  string name       = 2;  // basename of the path
+  int32  num_blocks = 3;  // number of allocated blocks (files only; 0 for dirs)
+}
+
+message StatRequest  { string path = 1; }
+message StatResponse { bool ok = 1; string error = 2; StatEntry entry = 3; }
+
+message ListDirRequest  { string path = 1; }
+message ListDirResponse {
+  bool             ok      = 1;
+  string           error   = 2;
+  repeated StatEntry entries = 3;
+}
 
 // ── Block routing ──────────────────────────────────────────────────────────
 

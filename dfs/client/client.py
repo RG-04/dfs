@@ -1,28 +1,32 @@
 """DFS client library.
 
 Stateless: no metadata cache, no data cache.
-Every public method opens fresh gRPC connections.
+Every public method opens a fresh gRPC connection.
+
+Namespace model
+---------------
+Directories must be explicitly created with ``mkdir`` before files can be
+placed inside them.  The root ``/`` always exists.  Operations that accept
+a path enforce that the parent directory exists.
 
 Offset decomposition
 --------------------
-All public methods take a **file-level byte offset** — the raw byte
+``read`` and ``write`` take a **file-level byte offset** — the raw byte
 position in the logical file, exactly like a POSIX seek position.
 
-Internally, the client splits each operation across block boundaries:
+Internally each operation is split across block boundaries:
 
     block_index        = file_offset // block_size
     intra_block_offset = file_offset %  block_size
 
 For every block touched the client:
-  1. Calls MasterNode.GetBlockInfo(path, block_index) to get the
-     assigned DataNode address.
-  2. Calls DataNode.ReadBlock / WriteBlock with the block_id and
-     intra_block_offset so the DataNode can seek to the exact byte
-     within its on-disk block file.
+  1. Calls ``MasterNode.GetBlockInfo(path, block_index)`` to get the
+     assigned DataNode address (always the current Raft leader).
+  2. Calls ``DataNode.ReadBlock`` / ``WriteBlock`` with the block_id and
+     intra_block_offset so the DataNode seeks to the exact byte within
+     its on-disk block file.
 
-A single client call may touch 1, 2, … N blocks depending on how many
-block boundaries the [offset, offset+length) range spans.  Each block
-operation is issued sequentially (Phase-1; Phase-2 may pipeline).
+A single call may span multiple blocks; each is issued sequentially.
 
 Usage::
 
@@ -34,12 +38,12 @@ Usage::
             config = yaml.safe_load(f)
         client = DFSClient(config)
 
-        await client.create("/myfile.bin")
-        # Write 5 bytes starting at file byte 1_000_005
-        await client.write("/myfile.bin", offset=1_000_005, data=b"hello")
-        # Read them back
-        data = await client.read("/myfile.bin", offset=1_000_005, length=5)
-        await client.delete("/myfile.bin")
+        await client.mkdir("/data")
+        await client.create("/data/hello.bin")
+        await client.write("/data/hello.bin", offset=0, data=b"hello")
+        data = await client.read("/data/hello.bin", offset=0, length=5)
+        await client.delete("/data/hello.bin")
+        await client.rmdir("/data")
 """
 
 import logging
@@ -57,6 +61,25 @@ _GRPC_OPTIONS = [
     ("grpc.max_send_message_length",    128 * 1024 * 1024),
     ("grpc.max_receive_message_length", 128 * 1024 * 1024),
 ]
+
+
+class StatResult:
+    """Metadata returned by :meth:`DFSClient.stat` and :meth:`DFSClient.ls`.
+
+    Attributes:
+        type:       ``"file"`` or ``"dir"``
+        name:       basename of the path
+        num_blocks: allocated block count (always 0 for directories)
+    """
+    __slots__ = ("type", "name", "num_blocks")
+
+    def __init__(self, type: str, name: str, num_blocks: int) -> None:
+        self.type       = type
+        self.name       = name
+        self.num_blocks = num_blocks
+
+    def __repr__(self) -> str:
+        return f"StatResult(type={self.type!r}, name={self.name!r}, num_blocks={self.num_blocks})"
 
 
 class DFSClient:
@@ -80,6 +103,61 @@ class DFSClient:
             resp = await stub.DeleteFile(master_pb2.DeleteFileRequest(path=path))
         if not resp.ok:
             raise DFSError(f"delete({path!r}): {resp.error}")
+
+    async def mkdir(self, path: str) -> None:
+        """Create a directory.  Parent directory must already exist."""
+        async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
+            stub = master_pb2_grpc.MasterNodeStub(ch)
+            resp = await stub.Mkdir(master_pb2.MkdirRequest(path=path))
+        if not resp.ok:
+            raise DFSError(f"mkdir({path!r}): {resp.error}")
+
+    async def rmdir(self, path: str) -> None:
+        """Remove an empty directory."""
+        async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
+            stub = master_pb2_grpc.MasterNodeStub(ch)
+            resp = await stub.Rmdir(master_pb2.RmdirRequest(path=path))
+        if not resp.ok:
+            raise DFSError(f"rmdir({path!r}): {resp.error}")
+
+    async def stat(self, path: str) -> "StatResult":
+        """Return metadata for a file or directory.
+
+        Returns a :class:`StatResult` with fields:
+          - ``type``: ``"file"`` or ``"dir"``
+          - ``name``: basename of the path
+          - ``num_blocks``: number of allocated blocks (0 for directories)
+        """
+        async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
+            stub = master_pb2_grpc.MasterNodeStub(ch)
+            resp = await stub.Stat(master_pb2.StatRequest(path=path))
+        if not resp.ok:
+            raise DFSError(f"stat({path!r}): {resp.error}")
+        is_dir = (resp.entry.type == master_pb2.StatEntry.DIR)
+        return StatResult(
+            type="dir" if is_dir else "file",
+            name=resp.entry.name,
+            num_blocks=resp.entry.num_blocks,
+        )
+
+    async def ls(self, path: str) -> List["StatResult"]:
+        """List the immediate children of a directory.
+
+        Returns a list of :class:`StatResult` sorted by name.
+        """
+        async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
+            stub = master_pb2_grpc.MasterNodeStub(ch)
+            resp = await stub.ListDir(master_pb2.ListDirRequest(path=path))
+        if not resp.ok:
+            raise DFSError(f"ls({path!r}): {resp.error}")
+        return [
+            StatResult(
+                type="dir" if e.type == master_pb2.StatEntry.DIR else "file",
+                name=e.name,
+                num_blocks=e.num_blocks,
+            )
+            for e in resp.entries
+        ]
 
     async def write(self, path: str, offset: int, data: bytes) -> None:
         """Write *data* to *path* starting at **file byte offset** *offset*.
