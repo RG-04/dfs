@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import readline  # noqa: F401 — activates history/editing for input()
+# import readline  # noqa: F401 — activates history/editing for input()
 import yaml
 
 from dfs.client.client import DFSClient, DFSError
@@ -220,7 +220,17 @@ async def cmd_cat(client: DFSClient, cwd: str, args: list[str], block_size: int)
     path = _resolve(cwd, args[0])
     chunks = []
     offset = 0
-    while True:
+
+    try:
+        s = await client.stat(path)
+        if s.type != "file":
+            _err(f"not a file: {path}")
+            return
+    except DFSError as exc:
+        _err(str(exc))
+        return
+
+    for _ in range(s.num_blocks):
         try:
             chunk = await client.read(path, offset=offset, length=block_size)
         except DFSError as exc:
@@ -231,9 +241,9 @@ async def cmd_cat(client: DFSClient, cwd: str, args: list[str], block_size: int)
         if not chunk:
             break
         chunks.append(chunk)
-        offset += len(chunk)
-        if len(chunk) < block_size:
-            break  # short read = end of written data
+        offset += block_size
+        # if len(chunk) < block_size:
+        #     break  # short read = end of written data
 
     raw = b"".join(chunks)
     if not raw:

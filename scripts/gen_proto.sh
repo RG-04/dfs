@@ -13,7 +13,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${PROJECT_ROOT}"
 
-"${PROJECT_ROOT}/.venv/bin/python" -m grpc_tools.protoc \
+python -m grpc_tools.protoc \
     -I proto \
     --python_out=dfs/proto \
     --grpc_python_out=dfs/proto \
