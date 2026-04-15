@@ -6,20 +6,21 @@ Usage:
 
 Commands
 --------
-  ls [path]                    list directory contents (default: cwd)
-  cd <path>                    change working directory
-  pwd                          print working directory
-  stat <path>                  show metadata for a file or directory
-  mkdir <path>                 create a directory (parent must exist)
-  rmdir <path>                 remove an empty directory
-  touch <path>                 create an empty file
-  rm <path>                    delete a file
-  write <path> <offset> <data> write text <data> at byte offset (creates if needed)
-  cat <path>                   print file contents (decoded as UTF-8 where possible)
-  put <local> [dfs_path]       upload a local file into DFS
-  get <dfs_path> [local]       download a DFS file to the local filesystem
-  help                         show this message
-  exit / quit                  exit the shell
+  ls [path]                         list directory contents (default: cwd)
+  cd <path>                         change working directory
+  pwd                               print working directory
+  stat <path>                       show metadata for a file or directory
+  mkdir <path>                      create a directory (parent must exist)
+  rmdir <path>                      remove an empty directory
+  touch <path>                      create an empty file
+  rm <path>                         delete a file
+  write <path> <offset> <data>      write text <data> at byte offset (creates if needed)
+  read  <path> <offset> <length>    read <length> bytes at byte offset and print
+  cat <path>                        print file contents (decoded as UTF-8 where possible)
+  put <local> [dfs_path]            upload a local file into DFS
+  get <dfs_path> [local]            download a DFS file to the local filesystem
+  help                              show this message
+  exit / quit                       exit the shell
 """
 
 import asyncio
@@ -175,6 +176,41 @@ async def cmd_write(client: DFSClient, cwd: str, args: list[str]) -> None:
         _ok(f"wrote {len(data)} byte(s) to {path} at offset {offset}")
     except DFSError as exc:
         _err(str(exc))
+
+
+async def cmd_read(client: DFSClient, cwd: str, args: list[str]) -> None:
+    if len(args) < 3:
+        _err("usage: read <path> <offset> <length>")
+        return
+    path = _resolve(cwd, args[0])
+    try:
+        offset = int(args[1])
+    except ValueError:
+        _err(f"offset must be an integer, got {args[1]!r}")
+        return
+    try:
+        length = int(args[2])
+    except ValueError:
+        _err(f"length must be an integer, got {args[2]!r}")
+        return
+    try:
+        data = await client.read(path, offset=offset, length=length)
+    except DFSError as exc:
+        _err(str(exc))
+        return
+    if not data:
+        _info("(no data)")
+        return
+    try:
+        print(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        print(_c("(binary content — hex dump)", DIM))
+        for i in range(0, len(data), 16):
+            row   = data[i:i+16]
+            hex_  = " ".join(f"{b:02x}" for b in row)
+            ascii = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+            print(f"  {offset+i:06x}  {hex_:<48}  {ascii}")
+    _info(f"({len(data)} byte(s) read from offset {offset})")
 
 
 async def cmd_cat(client: DFSClient, cwd: str, args: list[str], block_size: int) -> None:
@@ -349,6 +385,8 @@ async def repl(config: dict) -> None:
             await cmd_rm(client, cwd, args)
         elif cmd == "write":
             await cmd_write(client, cwd, args)
+        elif cmd == "read":
+            await cmd_read(client, cwd, args)
         elif cmd == "cat":
             await cmd_cat(client, cwd, args, block_size)
         elif cmd == "put":
