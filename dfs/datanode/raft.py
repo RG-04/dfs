@@ -48,12 +48,12 @@ logger = logging.getLogger(__name__)
 
 # ── Timing constants ───────────────────────────────────────────────────────
 
-ELECTION_TIMEOUT_MIN   = 0.15   # 150 ms
-ELECTION_TIMEOUT_MAX   = 0.30   # 300 ms
-HEARTBEAT_INTERVAL     = 0.05   # 50 ms  (Raft internal peer heartbeat)
+ELECTION_TIMEOUT_MIN   = 5   # 150 ms
+ELECTION_TIMEOUT_MAX   = 6   # 300 ms
+HEARTBEAT_INTERVAL     = 1.0   # 50 ms  (Raft internal peer heartbeat)
 MASTER_HB_INTERVAL     = 5.0    # 5 s    (leader → master heartbeat)
-RPC_TIMEOUT            = 0.08   # 80 ms  (peer RPC deadline)
-WRITE_TIMEOUT          = 5.0    # 5 s    (client write replication deadline)
+RPC_TIMEOUT            = 1.0   # 80 ms  (peer RPC deadline)
+WRITE_TIMEOUT          = 10.0    # 5 s    (client write replication deadline)
 
 _GRPC_OPTIONS = [
     ("grpc.max_send_message_length",    128 * 1024 * 1024),
@@ -821,7 +821,7 @@ class RaftNode:
             return resp.term, resp.vote_granted
         except Exception as exc:
             logger.debug(
-                "block[%.8s] RequestVote → %s FAILED: %s", self.block_id, peer, exc
+                "block[%.8s] RequestVote → %s FAILED: %r", self.block_id, peer, exc
             )
             return 0, False
 
@@ -910,7 +910,7 @@ class RaftNode:
 
         except Exception as exc:
             logger.debug(
-                "block[%.8s] AppendEntries → %s FAILED: %s",
+                "block[%.8s] AppendEntries → %s FAILED: %r",
                 self.block_id, peer, exc,
             )
 
@@ -972,5 +972,5 @@ class RaftNode:
                 )
         except Exception as exc:
             logger.debug(
-                "block[%.8s] master heartbeat FAILED: %s", self.block_id, exc
+                "block[%.8s] master heartbeat FAILED: %r", self.block_id, exc
             )
