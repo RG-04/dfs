@@ -241,8 +241,19 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             if status and status["leader_id"] == leader_id and term >= status["term"]:
                 status["last_hb"]   = time.monotonic()
                 status["available"] = True
+                logger.debug(
+                    "BlockHeartbeat: block %.8s leader=%s term=%d — OK",
+                    block_id, leader_id, term,
+                )
+            else:
+                logger.debug(
+                    "BlockHeartbeat: block %.8s leader=%s term=%d — IGNORED "
+                    "(status=%s)",
+                    block_id, leader_id, term,
+                    status,
+                )
 
-        return master_pb2.BlockHeartbeatResponse(ok=True)
+        return master_pb2.BlockHeartbeatResponse(ok=bool(status))
 
     # ── File namespace operations ──────────────────────────────────────────
 
@@ -357,6 +368,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         async with self._lock:
             path = request.path
             name = self._basename(path)
+            logger.debug("Stat: %r", path)
             if path in self._dirs or path.rstrip("/") == "":
                 return master_pb2.StatResponse(
                     ok=True,
@@ -368,6 +380,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 )
             if path in self._files:
                 num_blocks = len(self._files[path]["blocks"])
+                logger.debug("Stat: %r → FILE num_blocks=%d", path, num_blocks)
                 return master_pb2.StatResponse(
                     ok=True,
                     entry=master_pb2.StatEntry(
@@ -376,6 +389,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                         num_blocks=num_blocks,
                     ),
                 )
+            logger.debug("Stat: %r → NOT FOUND", path)
             return master_pb2.StatResponse(
                 ok=False, error=f"No such file or directory: {path}"
             )
@@ -390,6 +404,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
         async with self._lock:
             path = request.path.rstrip("/") or "/"
+            logger.debug("ListDir: %r", path)
             if path not in self._dirs:
                 if path in self._files:
                     return master_pb2.ListDirResponse(
@@ -562,6 +577,10 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         is_write    = (request.intent == master_pb2.Intent.WRITE)
 
         async with self._lock:
+            logger.debug(
+                "GetBlockInfo %r block[%d] intent=%s",
+                path, block_index, "WRITE" if is_write else "READ",
+            )
             if path not in self._files:
                 return master_pb2.GetBlockInfoResponse(
                     ok=False, error=f"File not found: {path}"
@@ -672,6 +691,13 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             last_known_term = status["term"] if status else 1
             min_leader_term = max(0, last_known_term - 1)
 
+            logger.debug(
+                "GetBlockInfo %r block[%d] → dn=%s block_id=%.8s "
+                "min_term=%d available=%s",
+                path, block_index, leader_dn, block_id,
+                min_leader_term, status["available"] if status else "unknown",
+            )
+
             return master_pb2.GetBlockInfoResponse(
                 ok=True,
                 block=master_pb2.BlockInfo(
@@ -728,9 +754,17 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
         Returns (ok, error_string).
         """
+        logger.debug(
+            "RegisterBlock %.8s on group=%s leader=%s peer_addrs=%s",
+            block_id, group, leader_dn, peer_addrs,
+        )
         for dn_id in group:
             dn_info   = self._registered_dns[dn_id]
             is_leader = (dn_id == leader_dn)
+            logger.debug(
+                "RegisterBlock %.8s → %s (%s:%d) is_leader=%s",
+                block_id, dn_id, dn_info["host"], dn_info["port"], is_leader,
+            )
             try:
                 async with aio.insecure_channel(
                     f"{dn_info['host']}:{dn_info['port']}",
@@ -748,6 +782,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     return False, (
                         f"DataNode {dn_id} rejected RegisterBlock: {resp.error}"
                     )
+                logger.debug("RegisterBlock %.8s → %s OK", block_id, dn_id)
             except Exception as exc:
                 return False, f"Could not reach DataNode {dn_id}: {exc}"
         return True, ""
@@ -760,15 +795,24 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             await asyncio.sleep(self._hb_timeout / 3)
             now = time.monotonic()
             async with self._lock:
+                logger.debug(
+                    "heartbeat_watchdog: checking %d block(s)", len(self._block_status)
+                )
                 for block_id, status in self._block_status.items():
+                    age = now - status["last_hb"]
                     if status["available"]:
-                        age = now - status["last_hb"]
                         if age > self._hb_timeout:
                             status["available"] = False
                             logger.warning(
                                 "block[%.8s] cluster UNAVAILABLE "
                                 "(no heartbeat from %s for %.1fs)",
                                 block_id, status["leader_id"], age,
+                            )
+                        else:
+                            logger.debug(
+                                "block[%.8s] leader=%s term=%d hb_age=%.1fs — OK",
+                                block_id, status["leader_id"],
+                                status["term"], age,
                             )
 
 

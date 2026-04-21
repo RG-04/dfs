@@ -91,34 +91,42 @@ class DFSClient:
     # ── Public API ─────────────────────────────────────────────────────────
 
     async def create(self, path: str) -> None:
+        logger.debug("create %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.CreateFile(master_pb2.CreateFileRequest(path=path))
         if not resp.ok:
             raise DFSError(f"create({path!r}): {resp.error}")
+        logger.debug("create %r OK", path)
 
     async def delete(self, path: str) -> None:
+        logger.debug("delete %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.DeleteFile(master_pb2.DeleteFileRequest(path=path))
         if not resp.ok:
             raise DFSError(f"delete({path!r}): {resp.error}")
+        logger.debug("delete %r OK", path)
 
     async def mkdir(self, path: str) -> None:
         """Create a directory.  Parent directory must already exist."""
+        logger.debug("mkdir %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.Mkdir(master_pb2.MkdirRequest(path=path))
         if not resp.ok:
             raise DFSError(f"mkdir({path!r}): {resp.error}")
+        logger.debug("mkdir %r OK", path)
 
     async def rmdir(self, path: str) -> None:
         """Remove an empty directory."""
+        logger.debug("rmdir %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.Rmdir(master_pb2.RmdirRequest(path=path))
         if not resp.ok:
             raise DFSError(f"rmdir({path!r}): {resp.error}")
+        logger.debug("rmdir %r OK", path)
 
     async def stat(self, path: str) -> "StatResult":
         """Return metadata for a file or directory.
@@ -128,29 +136,33 @@ class DFSClient:
           - ``name``: basename of the path
           - ``num_blocks``: number of allocated blocks (0 for directories)
         """
+        logger.debug("stat %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.Stat(master_pb2.StatRequest(path=path))
         if not resp.ok:
             raise DFSError(f"stat({path!r}): {resp.error}")
         is_dir = (resp.entry.type == master_pb2.StatEntry.DIR)
-        return StatResult(
+        result = StatResult(
             type="dir" if is_dir else "file",
             name=resp.entry.name,
             num_blocks=resp.entry.num_blocks,
         )
+        logger.debug("stat %r → type=%s num_blocks=%d", path, result.type, result.num_blocks)
+        return result
 
     async def ls(self, path: str) -> List["StatResult"]:
         """List the immediate children of a directory.
 
         Returns a list of :class:`StatResult` sorted by name.
         """
+        logger.debug("ls %r → master %s", path, self._master_addr)
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.ListDir(master_pb2.ListDirRequest(path=path))
         if not resp.ok:
             raise DFSError(f"ls({path!r}): {resp.error}")
-        return [
+        entries = [
             StatResult(
                 type="dir" if e.type == master_pb2.StatEntry.DIR else "file",
                 name=e.name,
@@ -158,6 +170,8 @@ class DFSClient:
             )
             for e in resp.entries
         ]
+        logger.debug("ls %r → %d entries", path, len(entries))
+        return entries
 
     async def write(self, path: str, offset: int, data: bytes) -> None:
         """Write *data* to *path* starting at **file byte offset** *offset*.
@@ -168,6 +182,10 @@ class DFSClient:
         """
         if not data:
             return
+
+        logger.debug(
+            "write %r offset=%d total_bytes=%d", path, offset, len(data)
+        )
 
         bs = self._block_size
         pos = 0  # bytes of *data* consumed so far
@@ -190,8 +208,9 @@ class DFSClient:
 
             pos += len(chunk)
             logger.debug(
-                "write %s block[%d] intra_offset=%d bytes=%d",
+                "write %r block[%d] intra_offset=%d bytes=%d  dn=%s:%d",
                 path, block_index, intra_block_offset, len(chunk),
+                block_info.datanode_host, block_info.datanode_port,
             )
 
     async def read(self, path: str, offset: int, length: int) -> bytes:
@@ -203,6 +222,8 @@ class DFSClient:
         """
         if length == 0:
             return b""
+
+        logger.debug("read %r offset=%d length=%d", path, offset, length)
 
         bs = self._block_size
         chunks: List[bytes] = []
@@ -220,7 +241,6 @@ class DFSClient:
 
             # --- 2. Ask MasterNode which DataNode owns this block ----------
             block_info = await self._get_block_info(path, block_index, write=False)
-            logger.info(f"block_info for {path} block[{block_index}]: {block_info}")
 
             # --- 3. Read from that DataNode --------------------------------
             chunk = await self._read_block(block_info, intra_block_offset, to_read)
@@ -228,13 +248,15 @@ class DFSClient:
             pos += len(chunk)
 
             logger.debug(
-                "read %s block[%d] intra_offset=%d requested=%d got=%d",
+                "read %r block[%d] intra_offset=%d requested=%d got=%d  dn=%s:%d",
                 path, block_index, intra_block_offset, to_read, len(chunk),
+                block_info.datanode_host, block_info.datanode_port,
             )
             if len(chunk) < to_read:
                 # Short read: end of written data in this block.
                 break
 
+        logger.debug("read %r done total_bytes=%d", path, pos)
         return b"".join(chunks)
 
     # ── Internal helpers ───────────────────────────────────────────────────
@@ -243,6 +265,10 @@ class DFSClient:
         self, path: str, block_index: int, *, write: bool
     ) -> master_pb2.BlockInfo:
         intent = master_pb2.Intent.WRITE if write else master_pb2.Intent.READ
+        logger.debug(
+            "GetBlockInfo %r block[%d] intent=%s → master %s",
+            path, block_index, "WRITE" if write else "READ", self._master_addr,
+        )
         async with aio.insecure_channel(self._master_addr, options=_GRPC_OPTIONS) as ch:
             stub = master_pb2_grpc.MasterNodeStub(ch)
             resp = await stub.GetBlockInfo(
@@ -257,6 +283,12 @@ class DFSClient:
                 f"GetBlockInfo({path!r}, block={block_index}, "
                 f"{'WRITE' if write else 'READ'}): {resp.error}"
             )
+        logger.debug(
+            "GetBlockInfo %r block[%d] → dn=%s block_id=%.8s min_term=%d",
+            path, block_index,
+            f"{resp.block.datanode_host}:{resp.block.datanode_port}",
+            resp.block.block_id, resp.block.min_leader_term,
+        )
         return resp.block
 
     async def _write_block(
@@ -266,6 +298,10 @@ class DFSClient:
         data: bytes,
     ) -> None:
         addr = f"{block.datanode_host}:{block.datanode_port}"
+        logger.debug(
+            "WriteBlock %.8s intra_offset=%d bytes=%d min_term=%d → %s",
+            block.block_id, intra_block_offset, len(data), block.min_leader_term, addr,
+        )
         try:
             async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
                 stub = datanode_pb2_grpc.DataNodeStub(ch)
@@ -283,6 +319,7 @@ class DFSClient:
             ) from exc
         if not resp.ok:
             raise DFSError(f"WriteBlock({block.block_id!r}): {resp.error}")
+        logger.debug("WriteBlock %.8s OK", block.block_id)
 
     async def _read_block(
         self,
@@ -291,6 +328,10 @@ class DFSClient:
         length: int,
     ) -> bytes:
         addr = f"{block.datanode_host}:{block.datanode_port}"
+        logger.debug(
+            "ReadBlock %.8s intra_offset=%d length=%d min_term=%d → %s",
+            block.block_id, intra_block_offset, length, block.min_leader_term, addr,
+        )
         try:
             async with aio.insecure_channel(addr, options=_GRPC_OPTIONS) as ch:
                 stub = datanode_pb2_grpc.DataNodeStub(ch)
@@ -308,6 +349,7 @@ class DFSClient:
             ) from exc
         if not resp.ok:
             raise DFSError(f"ReadBlock({block.block_id!r}): {resp.error}")
+        logger.debug("ReadBlock %.8s got=%d bytes", block.block_id, len(resp.data))
         return resp.data
 
 
