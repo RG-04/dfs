@@ -130,11 +130,20 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
     ) -> None:
         p    = self._block_path(block_id)
         mode = "r+b" if p.exists() else "wb"
+        logger.debug(
+            "DataNode %s: _apply_write %.8s intra_offset=%d bytes=%d mode=%s",
+            self._dn_id, block_id, intra_offset, len(data), mode,
+        )
         with open(p, mode) as fh:
             fh.seek(0, 2)
             current_size = fh.tell()
             if intra_offset > current_size:
-                fh.write(b"\x00" * (intra_offset - current_size))
+                pad = intra_offset - current_size
+                logger.debug(
+                    "DataNode %s: padding %.8s with %d null bytes",
+                    self._dn_id, block_id, pad,
+                )
+                fh.write(b"\x00" * pad)
             fh.seek(intra_offset)
             fh.write(data)
 
@@ -237,9 +246,18 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
         context,
     ) -> datanode_pb2.WriteBlockResponse:
         block_id = request.block_id
+        logger.debug(
+            "DataNode %s: WriteBlock %.8s intra_offset=%d bytes=%d min_term=%d",
+            self._dn_id, block_id, request.intra_block_offset,
+            len(request.data), request.min_term,
+        )
 
         async with self._lock:
             if block_id not in self._owned:
+                logger.debug(
+                    "DataNode %s: WriteBlock %.8s rejected — not owned",
+                    self._dn_id, block_id,
+                )
                 await context.abort(
                     grpc.StatusCode.PERMISSION_DENIED,
                     f"Block {block_id} not owned by DataNode {self._dn_id}",
@@ -248,11 +266,19 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
             raft = self._raft_nodes.get(block_id)
 
         if raft is None:
+            logger.debug(
+                "DataNode %s: WriteBlock %.8s rejected — no RaftNode",
+                self._dn_id, block_id,
+            )
             return datanode_pb2.WriteBlockResponse(
                 ok=False, error="Raft node not initialised for block"
             )
 
         if not raft.is_leader():
+            logger.debug(
+                "DataNode %s: WriteBlock %.8s rejected — not leader (leader=%s)",
+                self._dn_id, block_id, raft.leader_id,
+            )
             return datanode_pb2.WriteBlockResponse(
                 ok=False,
                 error=f"not leader (leader={raft.leader_id})",
@@ -273,11 +299,20 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
                 ),
             )
 
+        logger.debug(
+            "DataNode %s: WriteBlock %.8s accepted — replicating via Raft term=%d",
+            self._dn_id, block_id, raft.current_term,
+        )
         ok, err = await raft.append_and_replicate(
             request.intra_block_offset, request.data
         )
         if not ok:
+            logger.debug(
+                "DataNode %s: WriteBlock %.8s replication failed: %s",
+                self._dn_id, block_id, err,
+            )
             return datanode_pb2.WriteBlockResponse(ok=False, error=err)
+        logger.debug("DataNode %s: WriteBlock %.8s OK", self._dn_id, block_id)
         return datanode_pb2.WriteBlockResponse(ok=True)
 
     async def ReadBlock(
@@ -286,9 +321,18 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
         context,
     ) -> datanode_pb2.ReadBlockResponse:
         block_id = request.block_id
+        logger.debug(
+            "DataNode %s: ReadBlock %.8s intra_offset=%d length=%d min_term=%d",
+            self._dn_id, block_id, request.intra_block_offset,
+            request.length, request.min_term,
+        )
 
         async with self._lock:
             if block_id not in self._owned:
+                logger.debug(
+                    "DataNode %s: ReadBlock %.8s rejected — not owned",
+                    self._dn_id, block_id,
+                )
                 await context.abort(
                     grpc.StatusCode.PERMISSION_DENIED,
                     f"Block {block_id} not owned by DataNode {self._dn_id}",
@@ -298,6 +342,10 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
 
         # Only the leader serves reads (sequential consistency).
         if raft and not raft.is_leader():
+            logger.debug(
+                "DataNode %s: ReadBlock %.8s rejected — not leader (leader=%s)",
+                self._dn_id, block_id, raft.leader_id,
+            )
             return datanode_pb2.ReadBlockResponse(
                 ok=False,
                 error=f"not leader (leader={raft.leader_id})",
@@ -321,12 +369,20 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
 
         p = self._block_path(block_id)
         if not p.exists():
+            logger.debug(
+                "DataNode %s: ReadBlock %.8s — block file absent, returning empty",
+                self._dn_id, block_id,
+            )
             return datanode_pb2.ReadBlockResponse(ok=True, data=b"")
 
         try:
             with open(p, "rb") as fh:
                 fh.seek(request.intra_block_offset)
                 data = fh.read(request.length)
+            logger.debug(
+                "DataNode %s: ReadBlock %.8s OK got=%d bytes",
+                self._dn_id, block_id, len(data),
+            )
             return datanode_pb2.ReadBlockResponse(ok=True, data=data)
         except Exception as exc:
             logger.error("ReadBlock %s error: %s", block_id, exc)
@@ -339,15 +395,28 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
         request: datanode_pb2.VoteRequest,
         context,
     ) -> datanode_pb2.VoteResponse:
+        logger.debug(
+            "DataNode %s: RequestVote %.8s from=%s term=%d last_idx=%d last_term=%d",
+            self._dn_id, request.block_id, request.candidate_id,
+            request.term, request.last_log_index, request.last_log_term,
+        )
         async with self._lock:
             raft = self._raft_nodes.get(request.block_id)
         if raft is None:
+            logger.debug(
+                "DataNode %s: RequestVote %.8s — unknown block, rejecting",
+                self._dn_id, request.block_id,
+            )
             return datanode_pb2.VoteResponse(term=0, vote_granted=False)
         term, granted = await raft.handle_request_vote(
             request.term,
             request.candidate_id,
             request.last_log_index,
             request.last_log_term,
+        )
+        logger.debug(
+            "DataNode %s: RequestVote %.8s → term=%d granted=%s",
+            self._dn_id, request.block_id, term, granted,
         )
         return datanode_pb2.VoteResponse(term=term, vote_granted=granted)
 
@@ -356,9 +425,20 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
         request: datanode_pb2.AppendEntriesRequest,
         context,
     ) -> datanode_pb2.AppendEntriesResponse:
+        logger.debug(
+            "DataNode %s: AppendEntries %.8s from=%s term=%d "
+            "prev_idx=%d prev_term=%d entries=%d commit=%d",
+            self._dn_id, request.block_id, request.leader_id,
+            request.term, request.prev_log_index, request.prev_log_term,
+            len(request.entries), request.leader_commit,
+        )
         async with self._lock:
             raft = self._raft_nodes.get(request.block_id)
         if raft is None:
+            logger.debug(
+                "DataNode %s: AppendEntries %.8s — unknown block, rejecting",
+                self._dn_id, request.block_id,
+            )
             return datanode_pb2.AppendEntriesResponse(
                 term=0, success=False, match_index=0
             )
@@ -372,6 +452,10 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
             request.prev_log_term,
             entries,
             request.leader_commit,
+        )
+        logger.debug(
+            "DataNode %s: AppendEntries %.8s → term=%d success=%s match_idx=%d",
+            self._dn_id, request.block_id, term, success, match_idx,
         )
         return datanode_pb2.AppendEntriesResponse(
             term=term, success=success, match_index=match_idx
@@ -390,6 +474,10 @@ async def _register_loop(
 ) -> None:
     first = True
     while True:
+        logger.debug(
+            "DataNode %s: sending registration heartbeat → %s:%d",
+            dn_id, master_host, master_port,
+        )
         try:
             async with aio.insecure_channel(
                 f"{master_host}:{master_port}", options=_GRPC_OPTIONS
@@ -409,6 +497,11 @@ async def _register_loop(
                         dn_id, master_host, master_port,
                     )
                     first = False
+                else:
+                    logger.debug(
+                        "DataNode %s heartbeat ACK from %s:%d",
+                        dn_id, master_host, master_port,
+                    )
             else:
                 logger.warning("Registration rejected: %s", resp.error)
         except Exception as exc:

@@ -2,11 +2,14 @@
 """Entry-point for a DataNode.
 
 Usage:
-    python bin/datanode.py <datanode-id> [config.yaml]
+    python bin/datanode.py [--debug] <datanode-id> [config.yaml]
+
+Options:
+    --debug     Enable DEBUG-level logging (overrides config.yaml debug flag).
 
 Example:
     python bin/datanode.py dn0
-    python bin/datanode.py dn1 config.yaml
+    python bin/datanode.py --debug dn1 config.yaml
 """
 
 import asyncio
@@ -21,19 +24,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dfs.datanode.server import serve
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
-)
-
 
 def main() -> None:
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    debug_flag = "--debug" in args
+    args = [a for a in args if a != "--debug"]
+
+    if not args:
         print(__doc__, file=sys.stderr)
         sys.exit(1)
 
-    dn_id = sys.argv[1]
-    config_path = sys.argv[2] if len(sys.argv) > 2 else "config.yaml"
+    dn_id = args[0]
+    config_path = args[1] if len(args) > 1 else "config.yaml"
 
     with open(config_path) as fh:
         config = yaml.safe_load(fh)
@@ -42,6 +44,15 @@ def main() -> None:
     if dn_id not in known_ids:
         print(f"Unknown datanode id {dn_id!r}. Known: {known_ids}", file=sys.stderr)
         sys.exit(1)
+
+    debug = debug_flag or config.get("debug", False)
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
+    )
+    if debug:
+        logging.getLogger().info("DEBUG logging enabled for DataNode %s", dn_id)
 
     asyncio.run(serve(dn_id, config))
 

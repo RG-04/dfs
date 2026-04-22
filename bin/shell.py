@@ -24,6 +24,7 @@ Commands
 """
 
 import asyncio
+import logging
 import os
 import posixpath
 import sys
@@ -408,9 +409,21 @@ async def repl(config: dict) -> None:
 
 
 def main() -> None:
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    args = sys.argv[1:]
+    debug_flag = "--debug" in args
+    args = [a for a in args if a != "--debug"]
+
+    cfg_path = args[0] if args else "config.yaml"
     with open(cfg_path) as fh:
         config = yaml.safe_load(fh)
+
+    debug = debug_flag or config.get("debug", False)
+    log_level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
+    )
+
     asyncio.run(repl(config))
 
 

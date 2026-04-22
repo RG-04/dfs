@@ -48,12 +48,12 @@ logger = logging.getLogger(__name__)
 
 # ── Timing constants ───────────────────────────────────────────────────────
 
-ELECTION_TIMEOUT_MIN   = 0.15   # 150 ms
-ELECTION_TIMEOUT_MAX   = 0.30   # 300 ms
-HEARTBEAT_INTERVAL     = 0.05   # 50 ms  (Raft internal peer heartbeat)
+ELECTION_TIMEOUT_MIN   = 5   # 150 ms
+ELECTION_TIMEOUT_MAX   = 6   # 300 ms
+HEARTBEAT_INTERVAL     = 1.0   # 50 ms  (Raft internal peer heartbeat)
 MASTER_HB_INTERVAL     = 5.0    # 5 s    (leader → master heartbeat)
-RPC_TIMEOUT            = 0.08   # 80 ms  (peer RPC deadline)
-WRITE_TIMEOUT          = 5.0    # 5 s    (client write replication deadline)
+RPC_TIMEOUT            = 1.0   # 80 ms  (peer RPC deadline)
+WRITE_TIMEOUT          = 10.0    # 5 s    (client write replication deadline)
 
 _GRPC_OPTIONS = [
     ("grpc.max_send_message_length",    128 * 1024 * 1024),
@@ -196,6 +196,11 @@ class RaftNode:
                 f.flush()
                 os.fsync(f.fileno())
             tmp.rename(self._state_path())
+            logger.debug(
+                "block[%.8s] %s  persisted state  term=%d voted=%s applied=%d",
+                self.block_id, self.node_id,
+                payload["current_term"], payload["voted_for"], payload["last_applied"],
+            )
         except Exception as exc:
             logger.error("block[%.8s] _save_state FAILED: %s", self.block_id, exc)
             raise
@@ -231,6 +236,11 @@ class RaftNode:
             logger.error("block[%.8s] _append_log_entry FAILED: %s", self.block_id, exc)
             raise
         self._log.append(entry)
+        logger.debug(
+            "block[%.8s] %s  log entry persisted  idx=%d term=%d intra=%d bytes=%d",
+            self.block_id, self.node_id, len(self._log),
+            entry.term, entry.intra_offset, len(entry.data),
+        )
 
     def _truncate_log_locked(self, new_len: int) -> None:
         """Truncate log to *new_len* entries (in-memory and on disk).
@@ -296,6 +306,10 @@ class RaftNode:
 
     def start(self) -> None:
         """Schedule background Raft tasks on the running event loop."""
+        logger.debug(
+            "block[%.8s] %s  START  state=%s term=%d peers=%s",
+            self.block_id, self.node_id, self._state.value, self.current_term, self.peers,
+        )
         asyncio.create_task(self._apply_loop(), name=f"apply-{self.block_id[:8]}")
         asyncio.create_task(self._main_loop(),  name=f"main-{self.block_id[:8]}")
         if self._state == State.LEADER:
@@ -305,6 +319,10 @@ class RaftNode:
             asyncio.create_task(self._notify_master())
 
     def stop(self) -> None:
+        logger.debug(
+            "block[%.8s] %s  STOP  state=%s term=%d",
+            self.block_id, self.node_id, self._state.value, self.current_term,
+        )
         self._shutdown = True
         self._hb_event.set()
         self._rep_event.set()
@@ -346,12 +364,24 @@ class RaftNode:
 
         try:
             await asyncio.wait_for(asyncio.shield(fut), timeout=WRITE_TIMEOUT)
+            logger.debug(
+                "block[%.8s] %s  REPLICATED  idx=%d",
+                self.block_id, self.node_id, log_index,
+            )
             return True, ""
         except asyncio.TimeoutError:
             async with self._lock:
                 self._write_futures.pop(log_index, None)
+            logger.debug(
+                "block[%.8s] %s  REPLICATE TIMEOUT  idx=%d after %.1fs",
+                self.block_id, self.node_id, log_index, WRITE_TIMEOUT,
+            )
             return False, "replication timeout"
         except Exception as exc:
+            logger.debug(
+                "block[%.8s] %s  REPLICATE ERROR  idx=%d: %s",
+                self.block_id, self.node_id, log_index, exc,
+            )
             return False, str(exc)
 
     # ── Incoming Raft RPC handlers ─────────────────────────────────────────
@@ -643,22 +673,35 @@ class RaftNode:
         )
 
         votes = 1   # self-vote
-        for r in results:
-            if isinstance(r, tuple):
-                peer_term, granted = r
-                if peer_term > term:
-                    async with self._lock:
-                        logger.info(
-                            "block[%.8s] %s  HIGHER TERM SEEN  %d > %d — reverting",
-                            self.block_id, self.node_id, peer_term, term,
-                        )
-                        self._become_follower_locked(peer_term)
-                    return
-                if granted:
-                    votes += 1
+        for peer, r in zip(self.peers, results):
+            if isinstance(r, Exception):
+                logger.debug(
+                    "block[%.8s] %s  vote from %s — ERROR: %s",
+                    self.block_id, self.node_id, peer, r,
+                )
+                continue
+            peer_term, granted = r
+            logger.debug(
+                "block[%.8s] %s  vote from %s — term=%d granted=%s",
+                self.block_id, self.node_id, peer, peer_term, granted,
+            )
+            if peer_term > term:
+                async with self._lock:
+                    logger.info(
+                        "block[%.8s] %s  HIGHER TERM SEEN  %d > %d — reverting",
+                        self.block_id, self.node_id, peer_term, term,
+                    )
+                    self._become_follower_locked(peer_term)
+                return
+            if granted:
+                votes += 1
 
         total    = 1 + len(self.peers)
         majority = total // 2 + 1
+        logger.debug(
+            "block[%.8s] %s  vote tally: %d/%d (need %d)",
+            self.block_id, self.node_id, votes, total, majority,
+        )
 
         async with self._lock:
             if self._state != State.CANDIDATE or self.current_term != term:
@@ -686,18 +729,29 @@ class RaftNode:
         """Transition to follower with *term*.  Must hold self._lock.
         Persists state before returning.
         """
+        prev_state = self._state.value
         self._state       = State.FOLLOWER
         self.current_term = term
         self.voted_for    = None
         self._save_state()
+        logger.debug(
+            "block[%.8s] %s  → FOLLOWER  (was %s) term=%d",
+            self.block_id, self.node_id, prev_state, term,
+        )
 
     def _become_leader_locked(self) -> None:
         """Transition to leader.  Must hold self._lock."""
         self._state     = State.LEADER
         self._leader_id = self.node_id
+        log_len = len(self._log)
         for p in self.peers:
-            self._next_index[p]  = len(self._log) + 1
+            self._next_index[p]  = log_len + 1
             self._match_index[p] = 0
+        logger.debug(
+            "block[%.8s] %s  → LEADER  term=%d log_len=%d next_index=%s",
+            self.block_id, self.node_id, self.current_term, log_len,
+            {p: log_len + 1 for p in self.peers},
+        )
         asyncio.create_task(
             self._leader_loop(), name=f"leader-{self.block_id[:8]}"
         )
@@ -723,6 +777,10 @@ class RaftNode:
             for p in self.peers:
                 if self._match_index.get(p, 0) >= n:
                     count += 1
+            logger.debug(
+                "block[%.8s] %s  check_commit idx=%d term=%d replicated=%d/%d",
+                self.block_id, self.node_id, n, self._log[n - 1].term, count, total,
+            )
             if count >= majority:
                 if n > self.commit_index:
                     logger.debug(
@@ -763,7 +821,7 @@ class RaftNode:
             return resp.term, resp.vote_granted
         except Exception as exc:
             logger.debug(
-                "block[%.8s] RequestVote → %s FAILED: %s", self.block_id, peer, exc
+                "block[%.8s] RequestVote → %s FAILED: %r", self.block_id, peer, exc
             )
             return 0, False
 
@@ -852,7 +910,7 @@ class RaftNode:
 
         except Exception as exc:
             logger.debug(
-                "block[%.8s] AppendEntries → %s FAILED: %s",
+                "block[%.8s] AppendEntries → %s FAILED: %r",
                 self.block_id, peer, exc,
             )
 
@@ -887,6 +945,10 @@ class RaftNode:
             if self._state != State.LEADER:
                 return
             term = self.current_term
+        logger.debug(
+            "block[%.8s] %s  → BlockHeartbeat master=%s term=%d",
+            self.block_id, self.node_id, self._master, term,
+        )
         try:
             async with aio.insecure_channel(self._master, options=_GRPC_OPTIONS) as ch:
                 stub = master_pb2_grpc.MasterNodeStub(ch)
@@ -898,9 +960,17 @@ class RaftNode:
                     )
                 )
             if not resp.ok:
+                logger.debug(
+                    "block[%.8s] %s  BlockHeartbeat NACK — re-notifying master",
+                    self.block_id, self.node_id,
+                )
                 # Master doesn't know about this block yet; re-notify.
                 await self._notify_master()
+            else:
+                logger.debug(
+                    "block[%.8s] %s  BlockHeartbeat ACK", self.block_id, self.node_id
+                )
         except Exception as exc:
             logger.debug(
-                "block[%.8s] master heartbeat FAILED: %s", self.block_id, exc
+                "block[%.8s] master heartbeat FAILED: %r", self.block_id, exc
             )
