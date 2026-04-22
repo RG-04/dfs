@@ -69,7 +69,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
         # Runtime registration state
         self._registered_dns: Dict[str, dict] = {}   # dn_id → {host, port, last_seen}
-        self._addr_to_dn:     Dict[str, str]  = {}   # "host:port" → dn_id
+        # Pre-populated from static config so host:port → dn_id translation works
+        # immediately after a master restart, before DataNodes re-register.
+        self._addr_to_dn: Dict[str, str] = {
+            f"{dn['host']}:{dn['port']}": dn["id"]
+            for dn in config["datanodes"]
+        }
         self._ready  = asyncio.Event()
         self._lock   = asyncio.Lock()
 
