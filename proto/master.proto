@@ -28,6 +28,11 @@ service MasterNode {
   rpc NotifyLeader   (NotifyLeaderRequest)   returns (NotifyLeaderResponse);
   // Periodic heartbeat sent by the current Raft leader for each block.
   rpc BlockHeartbeat (BlockHeartbeatRequest) returns (BlockHeartbeatResponse);
+
+  // ── Dynamic membership ────────────────────────────────────────────────────
+  // Called by DataNode leader after committing a CONFIG (membership-change)
+  // log entry, so the Master can update its block metadata.
+  rpc UpdateBlockPeers (UpdateBlockPeersRequest) returns (UpdateBlockPeersResponse);
 }
 
 // ── File operations ────────────────────────────────────────────────────────
@@ -129,4 +134,17 @@ message BlockHeartbeatRequest {
 
 message BlockHeartbeatResponse {
   bool ok = 1;
+}
+
+// ── Dynamic membership ─────────────────────────────────────────────────────
+
+message UpdateBlockPeersRequest {
+  string          block_id  = 1;
+  repeated string peers     = 2;  // full new peer list as dn_id strings
+  int64           term      = 3;
+}
+
+message UpdateBlockPeersResponse {
+  bool   ok    = 1;
+  string error = 2;
 }

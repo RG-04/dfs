@@ -1,4 +1,4 @@
-"""Per-block Raft consensus node — Phase 2 (with persistence).
+"""Per-block Raft consensus node — Phase 2 (with persistence + dynamic membership).
 
 Every RaftNode persists the three Raft "durable" fields before replying to
 any RPC, exactly as the paper requires:
@@ -11,6 +11,14 @@ Additionally we persist *last_applied* so a restarting node knows which
 entries are already reflected in the on-disk block file and need not be
 re-applied.
 
+Dynamic membership uses the single-server-at-a-time approach:
+  • The Raft leader appends a CONFIG log entry containing the new peer list.
+  • All nodes switch to the new peer list when they apply that entry.
+  • Adding a peer: leader first sends InstallSnapshot to the new node so it
+    catches up with the current block state, then appends the CONFIG entry.
+  • Removing a peer: leader appends the CONFIG entry directly; the removed
+    node is excluded from future AppendEntries once the entry commits.
+
 On-disk layout (inside the DataNode's data_dir)
 ───────────────────────────────────────────────
   raft_{block_id}.json        – JSON: current_term, voted_for,
@@ -20,6 +28,9 @@ On-disk layout (inside the DataNode's data_dir)
 
 Binary log entry format (big-endian):
   [8 B term] [8 B intra_offset] [4 B data_len] [data_len B data]
+  [1 B entry_type]  (0=DATA, 1=CONFIG)
+  For CONFIG entries: after the data field comes a peers section:
+    [4 B peers_count] followed by peers_count × [4 B addr_len][addr bytes]
 
 Startup recovery
 ────────────────
@@ -60,8 +71,11 @@ _GRPC_OPTIONS = [
     ("grpc.max_receive_message_length", 128 * 1024 * 1024),
 ]
 
-# Binary log-entry header: term(u64) intra_offset(u64) data_len(u32)
-_LOG_HDR = struct.Struct(">QQI")
+# Binary log-entry header: term(u64) intra_offset(u64) data_len(u32) entry_type(u8)
+_LOG_HDR = struct.Struct(">QQIb")
+
+ENTRY_DATA   = 0
+ENTRY_CONFIG = 1
 
 
 # ── Data structures ────────────────────────────────────────────────────────
@@ -73,12 +87,21 @@ class State(Enum):
 
 
 class _LogEntry:
-    __slots__ = ("term", "intra_offset", "data")
+    __slots__ = ("term", "intra_offset", "data", "entry_type", "new_peers")
 
-    def __init__(self, term: int, intra_offset: int, data: bytes) -> None:
+    def __init__(
+        self,
+        term: int,
+        intra_offset: int,
+        data: bytes,
+        entry_type: int = ENTRY_DATA,
+        new_peers: Optional[List[str]] = None,
+    ) -> None:
         self.term         = term
         self.intra_offset = intra_offset
         self.data         = data
+        self.entry_type   = entry_type
+        self.new_peers    = new_peers or []
 
 
 # ── RaftNode ───────────────────────────────────────────────────────────────
@@ -178,11 +201,7 @@ class RaftNode:
     # ── Persistence: state file ────────────────────────────────────────────
 
     def _save_state(self) -> None:
-        """Atomically persist current_term, voted_for, last_applied, peers.
-
-        Must be called BEFORE sending any RPC response that acknowledges
-        the state change (Raft durability requirement).
-        """
+        """Atomically persist current_term, voted_for, last_applied, peers."""
         payload = {
             "current_term":  self.current_term,
             "voted_for":     self.voted_for,
@@ -197,9 +216,10 @@ class RaftNode:
                 os.fsync(f.fileno())
             tmp.rename(self._state_path())
             logger.debug(
-                "block[%.8s] %s  persisted state  term=%d voted=%s applied=%d",
+                "block[%.8s] %s  persisted state  term=%d voted=%s applied=%d peers=%s",
                 self.block_id, self.node_id,
-                payload["current_term"], payload["voted_for"], payload["last_applied"],
+                payload["current_term"], payload["voted_for"],
+                payload["last_applied"], payload["peers"],
             )
         except Exception as exc:
             logger.error("block[%.8s] _save_state FAILED: %s", self.block_id, exc)
@@ -222,14 +242,23 @@ class RaftNode:
     # ── Persistence: log file ──────────────────────────────────────────────
 
     def _append_log_entry_locked(self, entry: _LogEntry) -> None:
-        """Append one entry to in-memory log AND binary log file atomically.
-        Must hold self._lock and be called before replicating to peers.
+        """Append one entry to in-memory log AND binary log file.
+        Must hold self._lock.
         """
         p = self._log_path()
         try:
             with open(p, "ab") as f:
-                f.write(_LOG_HDR.pack(entry.term, entry.intra_offset, len(entry.data)))
+                f.write(_LOG_HDR.pack(
+                    entry.term, entry.intra_offset, len(entry.data), entry.entry_type
+                ))
                 f.write(entry.data)
+                if entry.entry_type == ENTRY_CONFIG:
+                    # Encode peers: [4B count] + per-peer [4B len][bytes]
+                    f.write(struct.pack(">I", len(entry.new_peers)))
+                    for peer in entry.new_peers:
+                        pb = peer.encode()
+                        f.write(struct.pack(">I", len(pb)))
+                        f.write(pb)
                 f.flush()
                 os.fsync(f.fileno())
         except Exception as exc:
@@ -237,9 +266,9 @@ class RaftNode:
             raise
         self._log.append(entry)
         logger.debug(
-            "block[%.8s] %s  log entry persisted  idx=%d term=%d intra=%d bytes=%d",
+            "block[%.8s] %s  log entry persisted  idx=%d term=%d type=%d bytes=%d",
             self.block_id, self.node_id, len(self._log),
-            entry.term, entry.intra_offset, len(entry.data),
+            entry.term, entry.entry_type, len(entry.data),
         )
 
     def _truncate_log_locked(self, new_len: int) -> None:
@@ -258,8 +287,16 @@ class RaftNode:
         try:
             with open(tmp, "wb") as f:
                 for e in keep:
-                    f.write(_LOG_HDR.pack(e.term, e.intra_offset, len(e.data)))
+                    f.write(_LOG_HDR.pack(
+                        e.term, e.intra_offset, len(e.data), e.entry_type
+                    ))
                     f.write(e.data)
+                    if e.entry_type == ENTRY_CONFIG:
+                        f.write(struct.pack(">I", len(e.new_peers)))
+                        for peer in e.new_peers:
+                            pb = peer.encode()
+                            f.write(struct.pack(">I", len(pb)))
+                            f.write(pb)
                 f.flush()
                 os.fsync(f.fileno())
             tmp.rename(p)
@@ -286,7 +323,7 @@ class RaftNode:
                             self.block_id, idx,
                         )
                         break
-                    term, intra_offset, data_len = _LOG_HDR.unpack(hdr)
+                    term, intra_offset, data_len, entry_type = _LOG_HDR.unpack(hdr)
                     data = f.read(data_len)
                     if len(data) < data_len:
                         logger.warning(
@@ -294,7 +331,22 @@ class RaftNode:
                             self.block_id, idx,
                         )
                         break
-                    entries.append(_LogEntry(term, intra_offset, data))
+                    new_peers: List[str] = []
+                    if entry_type == ENTRY_CONFIG:
+                        count_bytes = f.read(4)
+                        if len(count_bytes) < 4:
+                            break
+                        count = struct.unpack(">I", count_bytes)[0]
+                        for _ in range(count):
+                            ln_bytes = f.read(4)
+                            if len(ln_bytes) < 4:
+                                break
+                            ln = struct.unpack(">I", ln_bytes)[0]
+                            addr = f.read(ln)
+                            if len(addr) < ln:
+                                break
+                            new_peers.append(addr.decode())
+                    entries.append(_LogEntry(term, intra_offset, data, entry_type, new_peers))
                     idx += 1
         except Exception as exc:
             logger.error("block[%.8s] _load_log FAILED at entry %d: %s",
@@ -339,28 +391,35 @@ class RaftNode:
     async def append_and_replicate(
         self, intra_offset: int, data: bytes
     ) -> Tuple[bool, str]:
-        """Append a write to the log and wait for majority commit.
+        """Append a DATA write to the log and wait for majority commit."""
+        return await self._append_entry_and_wait(
+            _LogEntry(0, intra_offset, data, ENTRY_DATA)
+        )
 
-        Persists the log entry to disk before replicating (Raft §5.3).
-        Returns (ok, error_message).
-        """
+    async def append_config_and_replicate(
+        self, new_peers: List[str]
+    ) -> Tuple[bool, str]:
+        """Append a CONFIG membership-change entry and wait for majority commit."""
+        return await self._append_entry_and_wait(
+            _LogEntry(0, 0, b"", ENTRY_CONFIG, new_peers)
+        )
+
+    async def _append_entry_and_wait(self, entry: _LogEntry) -> Tuple[bool, str]:
         loop = asyncio.get_running_loop()
         async with self._lock:
             if self._state != State.LEADER:
                 return False, f"not leader (leader={self._leader_id})"
-            entry = _LogEntry(self.current_term, intra_offset, data)
-            # Persist BEFORE replicating.
+            entry.term = self.current_term
             self._append_log_entry_locked(entry)
-            log_index = len(self._log)   # 1-based
+            log_index = len(self._log)
             fut = loop.create_future()
             self._write_futures[log_index] = fut
             logger.debug(
-                "block[%.8s] %s  APPEND  idx=%d term=%d intra=%d len=%d",
-                self.block_id, self.node_id, log_index,
-                entry.term, intra_offset, len(data),
+                "block[%.8s] %s  APPEND  idx=%d term=%d type=%d",
+                self.block_id, self.node_id, log_index, entry.term, entry.entry_type,
             )
 
-        self._rep_event.set()   # wake leader loop immediately
+        self._rep_event.set()
 
         try:
             await asyncio.wait_for(asyncio.shield(fut), timeout=WRITE_TIMEOUT)
@@ -372,17 +431,143 @@ class RaftNode:
         except asyncio.TimeoutError:
             async with self._lock:
                 self._write_futures.pop(log_index, None)
-            logger.debug(
-                "block[%.8s] %s  REPLICATE TIMEOUT  idx=%d after %.1fs",
-                self.block_id, self.node_id, log_index, WRITE_TIMEOUT,
-            )
             return False, "replication timeout"
         except Exception as exc:
-            logger.debug(
-                "block[%.8s] %s  REPLICATE ERROR  idx=%d: %s",
-                self.block_id, self.node_id, log_index, exc,
-            )
             return False, str(exc)
+
+    # ── Dynamic membership ─────────────────────────────────────────────────
+
+    async def add_peer(self, new_peer: str, block_path: Path) -> Tuple[bool, str]:
+        """Add *new_peer* to this Raft group.
+
+        Steps:
+          1. Send InstallSnapshot to the new peer.
+          2. Append a CONFIG log entry with the updated peer list.
+          3. After commit, initialise replication tracking for the new peer.
+
+        Returns (ok, error).
+        """
+        async with self._lock:
+            if self._state != State.LEADER:
+                return False, f"not leader (leader={self._leader_id})"
+            if new_peer in self.peers:
+                return True, ""   # already a member
+            current_peers = list(self.peers)
+            snapshot_index = len(self._log)
+            snapshot_term  = self._log[-1].term if self._log else self.current_term
+            term = self.current_term
+
+        # Read the block file for snapshot data.
+        try:
+            if block_path.exists():
+                with open(block_path, "rb") as fh:
+                    snapshot_data = fh.read()
+            else:
+                snapshot_data = b""
+        except Exception as exc:
+            return False, f"could not read block file for snapshot: {exc}"
+
+        # Send snapshot to the new peer so it has block data before joining.
+        logger.info(
+            "block[%.8s] %s  InstallSnapshot → %s  snap_idx=%d bytes=%d",
+            self.block_id, self.node_id, new_peer, snapshot_index, len(snapshot_data),
+        )
+        ok, err = await self._install_snapshot_rpc(
+            new_peer, term, snapshot_index, snapshot_term,
+            snapshot_data, current_peers,
+        )
+        if not ok:
+            return False, f"InstallSnapshot failed: {err}"
+
+        # Append the CONFIG entry (includes new_peer).
+        new_peer_list = current_peers + [new_peer]
+        ok, err = await self.append_config_and_replicate(new_peer_list)
+        if not ok:
+            return False, f"CONFIG entry replication failed: {err}"
+
+        # Initialise leader tracking for new peer (post-commit; already unlocked).
+        async with self._lock:
+            self._next_index[new_peer]  = snapshot_index + 1
+            self._match_index[new_peer] = snapshot_index
+
+        logger.info(
+            "block[%.8s] %s  ADD PEER DONE  new_peer=%s peers=%s",
+            self.block_id, self.node_id, new_peer, self.peers,
+        )
+        return True, ""
+
+    async def remove_peer(self, peer: str) -> Tuple[bool, str]:
+        """Remove *peer* from this Raft group by appending a CONFIG entry."""
+        async with self._lock:
+            if self._state != State.LEADER:
+                return False, f"not leader (leader={self._leader_id})"
+            if peer not in self.peers and peer != self.node_id:
+                return True, ""   # not a member, nothing to do
+            new_peer_list = [p for p in self.peers if p != peer]
+
+        ok, err = await self.append_config_and_replicate(new_peer_list)
+        if not ok:
+            return False, f"CONFIG entry replication failed: {err}"
+
+        logger.info(
+            "block[%.8s] %s  REMOVE PEER DONE  removed=%s peers=%s",
+            self.block_id, self.node_id, peer, self.peers,
+        )
+        return True, ""
+
+    async def handle_install_snapshot(
+        self,
+        term: int,
+        leader_id: str,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        peers: List[str],
+        block_path: Path,
+    ) -> Tuple[int, bool, str]:
+        """Apply an InstallSnapshot from the leader.
+
+        Returns (current_term, success, error).
+        """
+        async with self._lock:
+            if term < self.current_term:
+                return self.current_term, False, "stale term"
+
+            if term > self.current_term:
+                self._become_follower_locked(term)
+
+            self._leader_id = leader_id
+            self._hb_event.set()
+
+            # Write snapshot data to block file.
+            try:
+                tmp = block_path.with_suffix(".snap_tmp")
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                tmp.rename(block_path)
+            except Exception as exc:
+                return self.current_term, False, f"snapshot write failed: {exc}"
+
+            # Discard any log entries covered by the snapshot.
+            self._log = []
+            self._last_applied   = last_included_index
+            self.commit_index    = last_included_index
+            self.peers           = [p for p in peers if p != self.node_id]
+            self._save_state()
+
+            # Truncate log file.
+            lp = self._log_path()
+            if lp.exists():
+                lp.unlink()
+
+        logger.info(
+            "block[%.8s] %s  INSTALL SNAPSHOT  leader=%s idx=%d peers=%s bytes=%d",
+            self.block_id, self.node_id, leader_id,
+            last_included_index, self.peers, len(data),
+        )
+        return self.current_term, True, ""
 
     # ── Incoming Raft RPC handlers ─────────────────────────────────────────
 
@@ -393,10 +578,7 @@ class RaftNode:
         last_log_index: int,
         last_log_term: int,
     ) -> Tuple[int, bool]:
-        """Handle RequestVote RPC.  Return (current_term, vote_granted).
-
-        Persists current_term / voted_for before returning.
-        """
+        """Handle RequestVote RPC.  Return (current_term, vote_granted)."""
         async with self._lock:
             state_changed = False
 
@@ -412,7 +594,7 @@ class RaftNode:
                     "block[%.8s] %s  TERM BUMP  %d → %d (saw RequestVote from %s)",
                     self.block_id, self.node_id, self.current_term, term, candidate_id,
                 )
-                self._become_follower_locked(term)   # saves state
+                self._become_follower_locked(term)
                 state_changed = True
 
             my_last_idx  = len(self._log)
@@ -453,13 +635,10 @@ class RaftNode:
         leader_id: str,
         prev_log_index: int,
         prev_log_term: int,
-        entries: List[Tuple[int, int, bytes]],   # (term, intra_offset, data)
+        entries: List[Tuple],   # (term, intra_offset, data[, entry_type, new_peers])
         leader_commit: int,
     ) -> Tuple[int, bool, int]:
-        """Handle AppendEntries RPC.  Return (current_term, success, match_index).
-
-        Persists any new/truncated log entries before returning.
-        """
+        """Handle AppendEntries RPC.  Return (current_term, success, match_index)."""
         async with self._lock:
             state_dirty = False
 
@@ -475,7 +654,7 @@ class RaftNode:
                     "block[%.8s] %s  TERM BUMP  %d → %d (AppendEntries from %s)",
                     self.block_id, self.node_id, self.current_term, term, leader_id,
                 )
-                self._become_follower_locked(term)   # saves state
+                self._become_follower_locked(term)
                 state_dirty = True
 
             if self._state == State.CANDIDATE:
@@ -488,7 +667,7 @@ class RaftNode:
                 state_dirty    = True
 
             self._leader_id = leader_id
-            self._hb_event.set()   # reset election timer
+            self._hb_event.set()
 
             # ── Log consistency check ──────────────────────────────────────
             if prev_log_index > 0:
@@ -516,11 +695,13 @@ class RaftNode:
 
             # ── Append / reconcile new entries ─────────────────────────────
             new_entries = 0
-            for i, (e_term, e_off, e_data) in enumerate(entries):
-                pos = prev_log_index + i          # 0-based position in _log
+            for i, raw in enumerate(entries):
+                e_term, e_off, e_data = raw[0], raw[1], raw[2]
+                e_type     = raw[3] if len(raw) > 3 else ENTRY_DATA
+                e_peers    = list(raw[4]) if len(raw) > 4 else []
+                pos = prev_log_index + i
                 if pos < len(self._log):
                     if self._log[pos].term != e_term:
-                        # Conflict at pos — truncate from here.
                         logger.info(
                             "block[%.8s] %s  LOG CONFLICT at pos=%d "
                             "want_term=%d have_term=%d — truncating",
@@ -528,10 +709,14 @@ class RaftNode:
                             e_term, self._log[pos].term,
                         )
                         self._truncate_log_locked(pos)
-                        self._append_log_entry_locked(_LogEntry(e_term, e_off, e_data))
+                        self._append_log_entry_locked(
+                            _LogEntry(e_term, e_off, e_data, e_type, e_peers)
+                        )
                         new_entries += 1
                 else:
-                    self._append_log_entry_locked(_LogEntry(e_term, e_off, e_data))
+                    self._append_log_entry_locked(
+                        _LogEntry(e_term, e_off, e_data, e_type, e_peers)
+                    )
                     new_entries += 1
 
             if new_entries:
@@ -569,7 +754,6 @@ class RaftNode:
             timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
             try:
                 await asyncio.wait_for(self._hb_event.wait(), timeout=timeout)
-                # Heartbeat received — remain follower.
             except asyncio.TimeoutError:
                 if not self._shutdown and self._state != State.LEADER:
                     logger.info(
@@ -581,7 +765,7 @@ class RaftNode:
 
     async def _leader_loop(self) -> None:
         """Send periodic AppendEntries / heartbeats to all peers while leader."""
-        master_hb_at = time.monotonic()   # send first heartbeat immediately
+        master_hb_at = time.monotonic()
 
         while not self._shutdown and self._state == State.LEADER:
             self._rep_event.clear()
@@ -612,8 +796,8 @@ class RaftNode:
     async def _apply_loop(self) -> None:
         """Apply committed entries to the block-file state machine.
 
-        Saves last_applied to disk after each successful apply so that a
-        restarting node knows which entries are already in the block file.
+        DATA entries call the apply_fn (file write).
+        CONFIG entries update the peer list and notify the master.
         """
         while not self._shutdown:
             async with self._lock:
@@ -623,14 +807,21 @@ class RaftNode:
                 idx   = self._last_applied + 1   # 1-based
                 entry = self._log[idx - 1]
 
-            # Apply (file I/O) without holding the lock.
+            # Apply without holding the lock.
             try:
-                await self._apply_fn(entry.intra_offset, entry.data)
-                logger.debug(
-                    "block[%.8s] %s  APPLY  idx=%d intra=%d len=%d",
-                    self.block_id, self.node_id, idx,
-                    entry.intra_offset, len(entry.data),
-                )
+                if entry.entry_type == ENTRY_DATA:
+                    await self._apply_fn(entry.intra_offset, entry.data)
+                    logger.debug(
+                        "block[%.8s] %s  APPLY DATA  idx=%d intra=%d len=%d",
+                        self.block_id, self.node_id, idx,
+                        entry.intra_offset, len(entry.data),
+                    )
+                elif entry.entry_type == ENTRY_CONFIG:
+                    await self._apply_config(entry.new_peers)
+                    logger.info(
+                        "block[%.8s] %s  APPLY CONFIG  idx=%d peers=%s",
+                        self.block_id, self.node_id, idx, entry.new_peers,
+                    )
             except Exception as exc:
                 logger.error(
                     "block[%.8s] apply error at log[%d]: %s",
@@ -642,10 +833,39 @@ class RaftNode:
             async with self._lock:
                 if idx > self._last_applied:
                     self._last_applied = idx
-                    self._save_state()   # persist last_applied after write
+                    self._save_state()
                 fut = self._write_futures.pop(idx, None)
                 if fut and not fut.done():
                     fut.set_result(True)
+
+    async def _apply_config(self, new_peers: List[str]) -> None:
+        """Switch to the new peer list when a CONFIG entry is applied."""
+        async with self._lock:
+            old_peers = list(self.peers)
+            # The peers list in the state file excludes self.
+            self.peers = [p for p in new_peers if p != self.node_id]
+            self._save_state()
+
+            if self._state == State.LEADER:
+                # Add tracking for any newly added peers.
+                for p in self.peers:
+                    if p not in self._next_index:
+                        self._next_index[p]  = len(self._log) + 1
+                        self._match_index[p] = 0
+                # Remove tracking for any removed peers.
+                for p in list(self._next_index.keys()):
+                    if p not in self.peers:
+                        del self._next_index[p]
+                        self._match_index.pop(p, None)
+
+        logger.info(
+            "block[%.8s] %s  CONFIG APPLIED  old=%s new=%s",
+            self.block_id, self.node_id, old_peers, self.peers,
+        )
+
+        # Notify master of updated membership (fire-and-forget).
+        if self._state == State.LEADER:
+            asyncio.create_task(self._notify_master_peers(new_peers))
 
     # ── Election ───────────────────────────────────────────────────────────
 
@@ -656,7 +876,7 @@ class RaftNode:
             self._state        = State.CANDIDATE
             self.current_term += 1
             self.voted_for     = self.node_id
-            self._save_state()   # persist term + vote before sending RequestVotes
+            self._save_state()
             term      = self.current_term
             last_idx  = len(self._log)
             last_term = self._log[-1].term if self._log else 0
@@ -722,13 +942,10 @@ class RaftNode:
                     "block[%.8s] %s  ELECTION LOST  term=%d votes=%d/%d — back to follower",
                     self.block_id, self.node_id, term, votes, total,
                 )
-                self._state    = State.FOLLOWER
-                # voted_for already persisted; no extra save needed.
+                self._state = State.FOLLOWER
 
     def _become_follower_locked(self, term: int) -> None:
-        """Transition to follower with *term*.  Must hold self._lock.
-        Persists state before returning.
-        """
+        """Transition to follower with *term*.  Must hold self._lock."""
         prev_state = self._state.value
         self._state       = State.FOLLOWER
         self.current_term = term
@@ -761,8 +978,6 @@ class RaftNode:
         """Advance commit_index to the highest safely replicatable entry.
 
         Only entries from the *current term* are directly committed (§5.4.2).
-        Entries from earlier terms are committed indirectly when a later
-        current-term entry commits.
         Must hold self._lock.
         """
         if self._state != State.LEADER:
@@ -814,10 +1029,6 @@ class RaftNode:
                     ),
                     timeout=RPC_TIMEOUT,
                 )
-            logger.debug(
-                "block[%.8s] %s  ← RequestVote  peer=%s term=%d granted=%s",
-                self.block_id, self.node_id, peer, resp.term, resp.vote_granted,
-            )
             return resp.term, resp.vote_granted
         except Exception as exc:
             logger.debug(
@@ -846,6 +1057,12 @@ class RaftNode:
                 intra_block_offset=e.intra_offset,
                 data=e.data,
                 index=prev_log_index + i + 1,
+                entry_type=(
+                    datanode_pb2.LogEntryType.CONFIG
+                    if e.entry_type == ENTRY_CONFIG
+                    else datanode_pb2.LogEntryType.DATA
+                ),
+                new_peers=e.new_peers,
             )
             for i, e in enumerate(entries_to_send)
         ]
@@ -914,6 +1131,38 @@ class RaftNode:
                 self.block_id, peer, exc,
             )
 
+    async def _install_snapshot_rpc(
+        self,
+        peer: str,
+        term: int,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        peers: List[str],
+    ) -> Tuple[bool, str]:
+        try:
+            async with aio.insecure_channel(peer, options=_GRPC_OPTIONS) as ch:
+                stub = datanode_pb2_grpc.DataNodeStub(ch)
+                resp = await asyncio.wait_for(
+                    stub.InstallSnapshot(
+                        datanode_pb2.InstallSnapshotRequest(
+                            block_id=self.block_id,
+                            term=term,
+                            leader_id=self.node_id,
+                            last_included_index=last_included_index,
+                            last_included_term=last_included_term,
+                            data=data,
+                            peers=peers + [peer],
+                        )
+                    ),
+                    timeout=30.0,   # snapshots can be large
+                )
+            if resp.success:
+                return True, ""
+            return False, resp.error
+        except Exception as exc:
+            return False, str(exc)
+
     # ── Master notifications ───────────────────────────────────────────────
 
     async def _notify_master(self) -> None:
@@ -937,6 +1186,30 @@ class RaftNode:
         except Exception as exc:
             logger.warning(
                 "block[%.8s] notify_master FAILED: %s — will retry on next heartbeat",
+                self.block_id, exc,
+            )
+
+    async def _notify_master_peers(self, new_peers: List[str]) -> None:
+        """Tell the MasterNode the updated full peer list after a CONFIG commit."""
+        try:
+            async with aio.insecure_channel(self._master, options=_GRPC_OPTIONS) as ch:
+                stub = master_pb2_grpc.MasterNodeStub(ch)
+                async with self._lock:
+                    term = self.current_term
+                await stub.UpdateBlockPeers(
+                    master_pb2.UpdateBlockPeersRequest(
+                        block_id=self.block_id,
+                        peers=new_peers,
+                        term=term,
+                    )
+                )
+            logger.info(
+                "block[%.8s] %s  UpdateBlockPeers ACK  peers=%s",
+                self.block_id, self.node_id, new_peers,
+            )
+        except Exception as exc:
+            logger.warning(
+                "block[%.8s] notify_master_peers FAILED: %s",
                 self.block_id, exc,
             )
 
@@ -964,7 +1237,6 @@ class RaftNode:
                     "block[%.8s] %s  BlockHeartbeat NACK — re-notifying master",
                     self.block_id, self.node_id,
                 )
-                # Master doesn't know about this block yet; re-notify.
                 await self._notify_master()
             else:
                 logger.debug(

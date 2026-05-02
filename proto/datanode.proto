@@ -17,6 +17,11 @@ service DataNode {
   // Raft peer RPCs (DataNode ↔ DataNode, not called by client or master)
   rpc RequestVote   (VoteRequest)            returns (VoteResponse);
   rpc AppendEntries (AppendEntriesRequest)   returns (AppendEntriesResponse);
+
+  // Dynamic membership (called by current Raft leader on behalf of MasterNode)
+  rpc AddPeer         (AddPeerRequest)         returns (AddPeerResponse);
+  rpc RemovePeer      (RemovePeerRequest)      returns (RemovePeerResponse);
+  rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 // ── Block lifecycle ────────────────────────────────────────────────────────
@@ -68,11 +73,22 @@ message WriteBlockResponse {
 
 // ── Raft messages ──────────────────────────────────────────────────────────
 
+// Entry types for the Raft log.
+// DATA   — a normal block write (intra_block_offset + data are used).
+// CONFIG — a membership change (new_peers replaces the group peer list).
+enum LogEntryType {
+  DATA   = 0;
+  CONFIG = 1;
+}
+
 message LogEntry {
-  int64  term               = 1;
-  int64  intra_block_offset = 2;
-  bytes  data               = 3;
-  int64  index              = 4;  // 1-based position in the log
+  int64        term               = 1;
+  int64        intra_block_offset = 2;
+  bytes        data               = 3;
+  int64        index              = 4;  // 1-based position in the log
+  LogEntryType entry_type         = 5;
+  // Populated for CONFIG entries only: the full new peer list (host:port).
+  repeated string new_peers       = 6;
 }
 
 message VoteRequest {
@@ -102,4 +118,47 @@ message AppendEntriesResponse {
   int64  term        = 1;
   bool   success     = 2;
   int64  match_index = 3;  // highest log index known to be replicated here
+}
+
+// ── Dynamic membership ─────────────────────────────────────────────────────
+
+// Sent by the MasterNode to the current Raft leader to add a new peer.
+// The leader will call InstallSnapshot on the new peer, then append a
+// CONFIG log entry to the group.
+message AddPeerRequest {
+  string block_id      = 1;
+  string new_peer_addr = 2;  // "host:port" of the node being added
+}
+message AddPeerResponse {
+  bool   ok    = 1;
+  string error = 2;
+}
+
+// Sent by the MasterNode to the current Raft leader to remove a peer.
+// The leader appends a CONFIG log entry removing that peer.
+message RemovePeerRequest {
+  string block_id       = 1;
+  string peer_addr      = 2;  // "host:port" of the node being removed
+}
+message RemovePeerResponse {
+  bool   ok    = 1;
+  string error = 2;
+}
+
+// Sent by the current Raft leader to a new peer to transfer the full
+// block snapshot (current block file contents) before normal replication.
+message InstallSnapshotRequest {
+  string block_id      = 1;
+  int64  term          = 2;
+  string leader_id     = 3;
+  int64  last_included_index = 4;  // log index the snapshot covers up to
+  int64  last_included_term  = 5;
+  bytes  data          = 6;        // full block file contents
+  // The current committed peer list (so the new peer knows the group).
+  repeated string peers = 7;
+}
+message InstallSnapshotResponse {
+  int64  term    = 1;
+  bool   success = 2;
+  string error   = 3;
 }

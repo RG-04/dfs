@@ -13,11 +13,21 @@ The MasterNode calls RegisterBlock exactly once per block (at allocation
 time).  The DataNode creates a fresh RaftNode, persists the initial
 state, and starts it.
 
+Dynamic membership
+──────────────────
+  • AddPeer      — received by the current Raft leader; delegates to RaftNode
+                   which sends InstallSnapshot then commits a CONFIG entry.
+  • RemovePeer   — received by the current Raft leader; commits a CONFIG entry.
+  • InstallSnapshot — received by the new peer node; applies snapshot data
+                   and resets Raft state so the node can join the group.
+
 RPC surface
 ───────────
-  • RegisterBlock / DeleteBlock   — MasterNode lifecycle calls
-  • ReadBlock / WriteBlock        — DFS client (leader-only)
-  • RequestVote / AppendEntries   — Raft peer (DataNode ↔ DataNode)
+  • RegisterBlock / DeleteBlock    — MasterNode lifecycle calls
+  • ReadBlock / WriteBlock         — DFS client (leader-only)
+  • RequestVote / AppendEntries    — Raft peer (DataNode ↔ DataNode)
+  • AddPeer / RemovePeer           — MasterNode dynamic membership calls
+  • InstallSnapshot                — Raft leader → new peer snapshot transfer
 """
 
 import asyncio
@@ -442,8 +452,16 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
             return datanode_pb2.AppendEntriesResponse(
                 term=0, success=False, match_index=0
             )
+        from dfs.datanode.raft import ENTRY_CONFIG, ENTRY_DATA
         entries = [
-            (e.term, e.intra_block_offset, e.data) for e in request.entries
+            (
+                e.term,
+                e.intra_block_offset,
+                e.data,
+                ENTRY_CONFIG if e.entry_type == datanode_pb2.LogEntryType.CONFIG else ENTRY_DATA,
+                list(e.new_peers),
+            )
+            for e in request.entries
         ]
         term, success, match_idx = await raft.handle_append_entries(
             request.term,
@@ -459,6 +477,133 @@ class DataNodeServicer(datanode_pb2_grpc.DataNodeServicer):
         )
         return datanode_pb2.AppendEntriesResponse(
             term=term, success=success, match_index=match_idx
+        )
+
+    # ── Dynamic membership RPCs ────────────────────────────────────────────
+
+    async def AddPeer(
+        self,
+        request: datanode_pb2.AddPeerRequest,
+        context,
+    ) -> datanode_pb2.AddPeerResponse:
+        block_id     = request.block_id
+        new_peer_addr = request.new_peer_addr
+        logger.info(
+            "DataNode %s: AddPeer %.8s new_peer=%s",
+            self._dn_id, block_id, new_peer_addr,
+        )
+
+        async with self._lock:
+            raft = self._raft_nodes.get(block_id)
+
+        if raft is None:
+            return datanode_pb2.AddPeerResponse(
+                ok=False, error=f"Block {block_id} not known on this node"
+            )
+        if not raft.is_leader():
+            return datanode_pb2.AddPeerResponse(
+                ok=False, error=f"Not leader (leader={raft.leader_id})"
+            )
+
+        block_path = self._block_path(block_id)
+        ok, err = await raft.add_peer(new_peer_addr, block_path)
+        if not ok:
+            logger.warning(
+                "DataNode %s: AddPeer %.8s new_peer=%s FAILED: %s",
+                self._dn_id, block_id, new_peer_addr, err,
+            )
+            return datanode_pb2.AddPeerResponse(ok=False, error=err)
+
+        logger.info(
+            "DataNode %s: AddPeer %.8s new_peer=%s OK",
+            self._dn_id, block_id, new_peer_addr,
+        )
+        return datanode_pb2.AddPeerResponse(ok=True)
+
+    async def RemovePeer(
+        self,
+        request: datanode_pb2.RemovePeerRequest,
+        context,
+    ) -> datanode_pb2.RemovePeerResponse:
+        block_id  = request.block_id
+        peer_addr = request.peer_addr
+        logger.info(
+            "DataNode %s: RemovePeer %.8s peer=%s",
+            self._dn_id, block_id, peer_addr,
+        )
+
+        async with self._lock:
+            raft = self._raft_nodes.get(block_id)
+
+        if raft is None:
+            return datanode_pb2.RemovePeerResponse(
+                ok=False, error=f"Block {block_id} not known on this node"
+            )
+        if not raft.is_leader():
+            return datanode_pb2.RemovePeerResponse(
+                ok=False, error=f"Not leader (leader={raft.leader_id})"
+            )
+
+        ok, err = await raft.remove_peer(peer_addr)
+        if not ok:
+            logger.warning(
+                "DataNode %s: RemovePeer %.8s peer=%s FAILED: %s",
+                self._dn_id, block_id, peer_addr, err,
+            )
+            return datanode_pb2.RemovePeerResponse(ok=False, error=err)
+
+        logger.info(
+            "DataNode %s: RemovePeer %.8s peer=%s OK",
+            self._dn_id, block_id, peer_addr,
+        )
+        return datanode_pb2.RemovePeerResponse(ok=True)
+
+    async def InstallSnapshot(
+        self,
+        request: datanode_pb2.InstallSnapshotRequest,
+        context,
+    ) -> datanode_pb2.InstallSnapshotResponse:
+        block_id = request.block_id
+        logger.info(
+            "DataNode %s: InstallSnapshot %.8s from=%s term=%d snap_idx=%d bytes=%d",
+            self._dn_id, block_id, request.leader_id,
+            request.term, request.last_included_index, len(request.data),
+        )
+
+        # Ensure this node owns the block (create a stub entry if new).
+        async with self._lock:
+            is_new_block = block_id not in self._owned
+            if is_new_block:
+                self._owned.add(block_id)
+                self._save_manifest()
+
+            raft = self._raft_nodes.get(block_id)
+            if raft is None:
+                # Brand-new node joining the group — create a fresh RaftNode.
+                peers = [p for p in request.peers if p != self._node_addr]
+                raft = self._make_raft_node(
+                    block_id, peers=peers, is_initial_leader=False
+                )
+                self._raft_nodes[block_id] = raft
+                raft.start()
+
+        block_path = self._block_path(block_id)
+        term, success, err = await raft.handle_install_snapshot(
+            term=request.term,
+            leader_id=request.leader_id,
+            last_included_index=request.last_included_index,
+            last_included_term=request.last_included_term,
+            data=request.data,
+            peers=list(request.peers),
+            block_path=block_path,
+        )
+        if not success:
+            logger.warning(
+                "DataNode %s: InstallSnapshot %.8s FAILED: %s",
+                self._dn_id, block_id, err,
+            )
+        return datanode_pb2.InstallSnapshotResponse(
+            term=term, success=success, error=err
         )
 
 

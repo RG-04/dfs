@@ -20,6 +20,20 @@ Raft integration
   seconds of silence from the leader.
 * New block allocation is denied when fewer than ``replication_factor``
   DataNodes are currently registered.
+
+Dynamic membership
+------------------
+* Any DataNode can register itself at runtime — there is no static allow-list.
+  ``config.yaml`` datanodes are still accepted, but extra nodes are welcome too.
+* Master becomes ready once at least ``replication_factor`` nodes have
+  registered, rather than waiting for every node listed in the config.
+* A recovery watchdog monitors unavailable blocks.  When a block has been
+  down for longer than ``recovery_threshold`` seconds (default: 3× heartbeat
+  timeout) the master picks a healthy spare DataNode and calls ``AddPeer``
+  on the current group leader to replace the dead member.
+* After a successful peer replacement the block metadata (peers list) is
+  updated via the ``UpdateBlockPeers`` RPC, which is called by the Raft
+  leader after the CONFIG entry commits.
 """
 
 import asyncio
@@ -29,7 +43,7 @@ import posixpath
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import grpc
 from grpc import aio
@@ -44,17 +58,25 @@ _GRPC_OPTIONS = [
     ("grpc.max_receive_message_length", 128 * 1024 * 1024),
 ]
 
+# How long a block must be unavailable before the master attempts peer
+# replacement.  Default: 3× heartbeat_timeout so one timeout cycle passes
+# before we start moving data around.
+_RECOVERY_MULTIPLIER = 3
+
 
 class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
     def __init__(self, config: dict) -> None:
         self._block_size:        int = config["block_size"]
         self._replication_factor: int = config.get("replication_factor", 3)
         self._hb_timeout:        float = float(config.get("heartbeat_timeout", 15))
-        # How long since the last registration heartbeat before a DataNode is
-        # considered unreachable for new block allocation.  Defaults to the
-        # DataNode heartbeat interval (10 s) plus a generous margin.
         self._dn_liveness_timeout: float = float(
             config.get("dn_liveness_timeout", 30)
+        )
+        self._recovery_threshold: float = float(
+            config.get(
+                "recovery_threshold",
+                self._hb_timeout * _RECOVERY_MULTIPLIER,
+            )
         )
 
         # Metadata persistence
@@ -62,19 +84,18 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         meta_dir.mkdir(parents=True, exist_ok=True)
         self._meta_file = meta_dir / "metadata.json"
 
-        # Expected DataNodes from static config
-        self._expected_dns: Dict[str, dict] = {
-            dn["id"]: dn for dn in config["datanodes"]
-        }
+        # Runtime registration state — populated lazily as nodes register.
+        # dn_id → {host, port, last_seen}
+        self._registered_dns: Dict[str, dict] = {}
+        # "host:port" → dn_id  (for leader address translation from Raft nodes)
+        self._addr_to_dn: Dict[str, str] = {}
 
-        # Runtime registration state
-        self._registered_dns: Dict[str, dict] = {}   # dn_id → {host, port, last_seen}
-        # Pre-populated from static config so host:port → dn_id translation works
-        # immediately after a master restart, before DataNodes re-register.
-        self._addr_to_dn: Dict[str, str] = {
-            f"{dn['host']}:{dn['port']}": dn["id"]
-            for dn in config["datanodes"]
-        }
+        # Pre-populate addr_to_dn from config so that host:port → dn_id
+        # translation works immediately after a master restart, before
+        # DataNodes re-register.
+        for dn in config.get("datanodes", []):
+            self._addr_to_dn[f"{dn['host']}:{dn['port']}"] = dn["id"]
+
         self._ready  = asyncio.Event()
         self._lock   = asyncio.Lock()
 
@@ -90,15 +111,17 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         # Directory set — "/" is always present.
         self._dirs:  Set[str]        = {"/"}
         # Persistent deletion queue.
-        # Each entry: {"block_id": str, "pending_peers": [dn_id, ...]}
-        # Survives master restarts; entries are removed once all peers confirm.
         self._delete_queue: List[dict] = []
         self._load_metadata()
 
         # Per-block leader tracking (volatile — rebuilt from NotifyLeader /
         # BlockHeartbeat after restart).
-        # block_id → {leader_id, term, last_hb, available}
+        # block_id → {leader_id, term, last_hb, available, unavailable_since}
         self._block_status: Dict[str, dict] = {}
+
+        # In-flight peer-replacement set: block_ids currently being recovered
+        # so we don't start two parallel replacements for the same block.
+        self._recovering_blocks: Set[str] = set()
 
         # Signals the deletion loop that new work has been enqueued.
         self._delete_event = asyncio.Event()
@@ -134,7 +157,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
     @staticmethod
     def _parent(path: str) -> str:
-        """Return the parent directory of *path* using POSIX semantics."""
         parent = posixpath.dirname(path.rstrip("/"))
         return parent or "/"
 
@@ -151,11 +173,11 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             await asyncio.wait_for(self._ready.wait(), timeout=5.0)
             return True
         except asyncio.TimeoutError:
-            registered = set(self._registered_dns)
-            missing    = set(self._expected_dns) - registered
+            live = len(self._available_dns())
             await context.abort(
                 grpc.StatusCode.UNAVAILABLE,
-                f"Master not ready — waiting for DataNodes: {sorted(missing)}",
+                f"Master not ready — need {self._replication_factor} DataNode(s), "
+                f"have {live} live",
             )
             return False
 
@@ -167,13 +189,9 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         context,
     ) -> master_pb2.RegisterDNResponse:
         dn_id = request.datanode_id
-        if dn_id not in self._expected_dns:
-            return master_pb2.RegisterDNResponse(
-                ok=False, error=f"Unknown DataNode: {dn_id}"
-            )
 
         async with self._lock:
-            now = time.monotonic()
+            now    = time.monotonic()
             is_new = dn_id not in self._registered_dns
             self._registered_dns[dn_id] = {
                 "host":      request.host,
@@ -189,10 +207,16 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 logger.debug(
                     "DataNode %s heartbeat (%s:%d)", dn_id, request.host, request.port
                 )
-            if set(self._registered_dns) >= set(self._expected_dns):
-                if not self._ready.is_set():
+
+            # Become ready once we have at least replication_factor live nodes.
+            if not self._ready.is_set():
+                live = self._available_dns_locked(now)
+                if len(live) >= self._replication_factor:
                     self._ready.set()
-                    logger.info("All DataNodes registered — MasterNode is ready")
+                    logger.info(
+                        "MasterNode ready — %d DataNode(s) live (need %d)",
+                        len(live), self._replication_factor,
+                    )
 
         return master_pb2.RegisterDNResponse(ok=True)
 
@@ -204,21 +228,19 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         context,
     ) -> master_pb2.NotifyLeaderResponse:
         block_id  = request.block_id
-        # leader_id from RaftNode is "host:port"; translate to dn_id.
         leader_id = self._addr_to_dn.get(request.leader_id, request.leader_id)
         term      = request.term
 
         async with self._lock:
             existing = self._block_status.get(block_id, {})
-            # Accept only if the term is newer (or first notification).
             if term >= existing.get("term", -1):
                 self._block_status[block_id] = {
-                    "leader_id": leader_id,
-                    "term":      term,
-                    "last_hb":   time.monotonic(),
-                    "available": True,
+                    "leader_id":        leader_id,
+                    "term":             term,
+                    "last_hb":          time.monotonic(),
+                    "available":        True,
+                    "unavailable_since": None,
                 }
-                # Also update the persisted leader_id in block metadata.
                 for file_meta in self._files.values():
                     for blk in file_meta["blocks"]:
                         if blk["block_id"] == block_id:
@@ -244,8 +266,9 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         async with self._lock:
             status = self._block_status.get(block_id)
             if status and status["leader_id"] == leader_id and term >= status["term"]:
-                status["last_hb"]   = time.monotonic()
-                status["available"] = True
+                status["last_hb"]          = time.monotonic()
+                status["available"]        = True
+                status["unavailable_since"] = None
                 logger.debug(
                     "BlockHeartbeat: block %.8s leader=%s term=%d — OK",
                     block_id, leader_id, term,
@@ -254,11 +277,50 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 logger.debug(
                     "BlockHeartbeat: block %.8s leader=%s term=%d — IGNORED "
                     "(status=%s)",
-                    block_id, leader_id, term,
-                    status,
+                    block_id, leader_id, term, status,
                 )
 
         return master_pb2.BlockHeartbeatResponse(ok=bool(status))
+
+    # ── Dynamic membership ─────────────────────────────────────────────────
+
+    async def UpdateBlockPeers(
+        self,
+        request: master_pb2.UpdateBlockPeersRequest,
+        context,
+    ) -> master_pb2.UpdateBlockPeersResponse:
+        """Called by the Raft leader after a CONFIG entry commits.
+
+        Updates the block's peer list in persisted metadata and clears the
+        in-flight recovery flag so another replacement can start if needed.
+        """
+        block_id  = request.block_id
+        new_peers = list(request.peers)   # dn_id strings
+
+        async with self._lock:
+            found = False
+            for file_meta in self._files.values():
+                for blk in file_meta["blocks"]:
+                    if blk["block_id"] == block_id:
+                        blk["peers"] = new_peers
+                        found = True
+                        break
+                if found:
+                    break
+
+            if not found:
+                return master_pb2.UpdateBlockPeersResponse(
+                    ok=False, error=f"Block {block_id} not found"
+                )
+
+            self._recovering_blocks.discard(block_id)
+            self._save_metadata()
+            logger.info(
+                "UpdateBlockPeers: block %.8s peers=%s",
+                block_id, new_peers,
+            )
+
+        return master_pb2.UpdateBlockPeersResponse(ok=True)
 
     # ── File namespace operations ──────────────────────────────────────────
 
@@ -344,14 +406,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 return master_pb2.RmdirResponse(
                     ok=False, error=f"Directory not found: {path}"
                 )
-            # Fail if any file lives directly inside this directory.
             prefix = path + "/"
             for fpath in self._files:
                 if fpath.startswith(prefix):
                     return master_pb2.RmdirResponse(
                         ok=False, error=f"Directory not empty: {path}"
                     )
-            # Fail if any subdirectory lives directly inside.
             for dpath in self._dirs:
                 if dpath != path and dpath.startswith(prefix):
                     return master_pb2.RmdirResponse(
@@ -385,7 +445,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 )
             if path in self._files:
                 num_blocks = len(self._files[path]["blocks"])
-                logger.debug("Stat: %r → FILE num_blocks=%d", path, num_blocks)
                 return master_pb2.StatResponse(
                     ok=True,
                     entry=master_pb2.StatEntry(
@@ -394,7 +453,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                         num_blocks=num_blocks,
                     ),
                 )
-            logger.debug("Stat: %r → NOT FOUND", path)
             return master_pb2.StatResponse(
                 ok=False, error=f"No such file or directory: {path}"
             )
@@ -409,7 +467,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
         async with self._lock:
             path = request.path.rstrip("/") or "/"
-            logger.debug("ListDir: %r", path)
             if path not in self._dirs:
                 if path in self._files:
                     return master_pb2.ListDirResponse(
@@ -421,19 +478,16 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
             entries: List[master_pb2.StatEntry] = []
 
-            # Immediate subdirectories
             for dpath in sorted(self._dirs):
                 if dpath == path:
                     continue
-                parent = self._parent(dpath)
-                if parent == path:
+                if self._parent(dpath) == path:
                     entries.append(master_pb2.StatEntry(
                         type=master_pb2.StatEntry.DIR,
                         name=self._basename(dpath),
                         num_blocks=0,
                     ))
 
-            # Immediate files
             for fpath in sorted(self._files):
                 if self._parent(fpath) == path:
                     entries.append(master_pb2.StatEntry(
@@ -464,12 +518,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 "DeleteFile: %s (%d block(s))", path, len(file_meta["blocks"])
             )
 
-        # Enqueue deletions for all blocks durably, then signal the retry loop.
         async with self._lock:
             for blk in file_meta["blocks"]:
                 block_id = blk["block_id"]
                 peers    = [p for p in blk.get("peers", [blk.get("datanode_id")]) if p]
                 self._block_status.pop(block_id, None)
+                self._recovering_blocks.discard(block_id)
                 self._delete_queue.append({
                     "block_id":      block_id,
                     "pending_peers": list(peers),
@@ -480,17 +534,11 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         return master_pb2.DeleteFileResponse(ok=True)
 
     async def _deletion_loop(self) -> None:
-        """Background loop that drains the persistent deletion queue.
-
-        Retries pending DeleteBlock RPCs with exponential backoff.  An entry
-        is removed from the queue only after every peer confirms deletion.
-        Survives master restarts because the queue is persisted to disk.
-        """
+        """Background loop that drains the persistent deletion queue."""
         _MAX_BACKOFF = 60.0
         backoff = 2.0
 
         while True:
-            # Wait until there is work or until the backoff expires.
             try:
                 await asyncio.wait_for(self._delete_event.wait(), timeout=backoff)
             except asyncio.TimeoutError:
@@ -501,7 +549,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 if not self._delete_queue:
                     backoff = 2.0
                     continue
-                # Snapshot the queue so we can release the lock during RPCs.
                 snapshot = [dict(e) for e in self._delete_queue]
 
             any_failure = False
@@ -547,9 +594,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
                 entry["pending_peers"] = still_pending
 
-            # Write updated queue back; drop fully-confirmed entries.
             async with self._lock:
-                # Merge results back: update pending_peers in the live queue.
                 by_id = {e["block_id"]: e for e in snapshot}
                 self._delete_queue = [
                     {**q, "pending_peers": by_id[q["block_id"]]["pending_peers"]}
@@ -608,15 +653,13 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
 
                 group     = self._pick_group(avail, self._replication_factor)
                 block_id  = str(uuid.uuid4())
-                leader_dn = group[0]   # master designates the first as initial leader
+                leader_dn = group[0]
 
-                # Build the "host:port" address list for the Raft group.
                 peer_addrs = [
                     f"{self._registered_dns[dn_id]['host']}:{self._registered_dns[dn_id]['port']}"
                     for dn_id in group
                 ]
 
-                # Call RegisterBlock on every group member.
                 ok, err = await self._register_block_on_group(
                     block_id, group, peer_addrs, leader_dn
                 )
@@ -630,13 +673,12 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                 })
                 self._save_metadata()
 
-                # Optimistically mark the block as available with the
-                # designated initial leader (updated by NotifyLeader shortly).
                 self._block_status[block_id] = {
-                    "leader_id": leader_dn,
-                    "term":      1,
-                    "last_hb":   time.monotonic(),
-                    "available": True,
+                    "leader_id":         leader_dn,
+                    "term":              1,
+                    "last_hb":           time.monotonic(),
+                    "available":         True,
+                    "unavailable_since": None,
                 }
 
                 logger.info(
@@ -653,7 +695,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     ),
                 )
             else:
-                # READ or existing block WRITE
                 if block_index >= num_blocks:
                     return master_pb2.GetBlockInfoResponse(
                         ok=False,
@@ -667,7 +708,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             block_id  = blk["block_id"]
             leader_dn = blk.get("leader_id") or blk.get("datanode_id")
 
-            # Check cluster availability.
             status = self._block_status.get(block_id)
             if status:
                 if not status["available"]:
@@ -678,7 +718,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                             f"(no heartbeat from leader {status['leader_id']})"
                         ),
                     )
-                # Use the most up-to-date leader from live notifications.
                 leader_dn = status["leader_id"]
 
             dn_info = self._registered_dns.get(leader_dn)
@@ -688,11 +727,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     error=f"Leader DataNode {leader_dn} not registered",
                 )
 
-            # min_leader_term is one below the last known election term.
-            # A DataNode must have current_term > min_leader_term to serve
-            # the request, which means it must be at term >= last_known_term.
-            # This rejects isolated leaders that were superseded by a newer
-            # election the Master already knows about.
             last_known_term = status["term"] if status else 1
             min_leader_term = max(0, last_known_term - 1)
 
@@ -717,9 +751,11 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
     # ── Block allocation helpers ───────────────────────────────────────────
 
     def _available_dns(self) -> List[str]:
-        """Return IDs of DataNodes that have sent a heartbeat recently enough
-        to be considered alive for new block allocation."""
-        cutoff = time.monotonic() - self._dn_liveness_timeout
+        """Return IDs of DataNodes that have sent a heartbeat recently."""
+        return self._available_dns_locked(time.monotonic())
+
+    def _available_dns_locked(self, now: float) -> List[str]:
+        cutoff = now - self._dn_liveness_timeout
         live   = []
         for dn_id, info in self._registered_dns.items():
             last_seen = info.get("last_seen", 0)
@@ -728,7 +764,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             else:
                 logger.debug(
                     "DataNode %s excluded from allocation (last seen %.1fs ago)",
-                    dn_id, time.monotonic() - last_seen,
+                    dn_id, now - last_seen,
                 )
         return sorted(live)
 
@@ -741,7 +777,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
             if dn_id not in group:
                 group.append(dn_id)
             else:
-                # Skip duplicates by looking further
                 for dn in avail:
                     if dn not in group:
                         group.append(dn)
@@ -755,10 +790,7 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         peer_addrs: List[str],
         leader_dn: str,
     ) -> tuple:
-        """Call RegisterBlock on every DataNode in the group.
-
-        Returns (ok, error_string).
-        """
+        """Call RegisterBlock on every DataNode in the group."""
         logger.debug(
             "RegisterBlock %.8s on group=%s leader=%s peer_addrs=%s",
             block_id, group, leader_dn, peer_addrs,
@@ -766,10 +798,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
         for dn_id in group:
             dn_info   = self._registered_dns[dn_id]
             is_leader = (dn_id == leader_dn)
-            logger.debug(
-                "RegisterBlock %.8s → %s (%s:%d) is_leader=%s",
-                block_id, dn_id, dn_info["host"], dn_info["port"], is_leader,
-            )
             try:
                 async with aio.insecure_channel(
                     f"{dn_info['host']}:{dn_info['port']}",
@@ -787,7 +815,6 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     return False, (
                         f"DataNode {dn_id} rejected RegisterBlock: {resp.error}"
                     )
-                logger.debug("RegisterBlock %.8s → %s OK", block_id, dn_id)
             except Exception as exc:
                 return False, f"Could not reach DataNode {dn_id}: {exc}"
         return True, ""
@@ -807,7 +834,8 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                     age = now - status["last_hb"]
                     if status["available"]:
                         if age > self._hb_timeout:
-                            status["available"] = False
+                            status["available"]        = False
+                            status["unavailable_since"] = now
                             logger.warning(
                                 "block[%.8s] cluster UNAVAILABLE "
                                 "(no heartbeat from %s for %.1fs)",
@@ -819,6 +847,226 @@ class MasterNodeServicer(master_pb2_grpc.MasterNodeServicer):
                                 block_id, status["leader_id"],
                                 status["term"], age,
                             )
+
+    # ── Peer recovery watchdog ─────────────────────────────────────────────
+
+    async def _recovery_watchdog(self) -> None:
+        """Trigger peer replacement for blocks that have been unavailable too long."""
+        while True:
+            await asyncio.sleep(self._hb_timeout / 3)
+            now = time.monotonic()
+
+            candidates = []
+            async with self._lock:
+                for block_id, status in self._block_status.items():
+                    if status["available"]:
+                        continue
+                    if block_id in self._recovering_blocks:
+                        continue
+                    unavail_since = status.get("unavailable_since")
+                    if unavail_since is None:
+                        continue
+                    if (now - unavail_since) >= self._recovery_threshold:
+                        # Find this block's peer list and leader from metadata.
+                        blk_meta = self._find_block_meta(block_id)
+                        if blk_meta is None:
+                            continue
+                        candidates.append((block_id, status, blk_meta))
+
+            for block_id, status, blk_meta in candidates:
+                asyncio.create_task(
+                    self._recover_block(block_id, status, blk_meta),
+                    name=f"recover-{block_id[:8]}",
+                )
+
+    def _find_block_meta(self, block_id: str) -> Optional[dict]:
+        """Return the block dict from _files for block_id, or None."""
+        for file_meta in self._files.values():
+            for blk in file_meta["blocks"]:
+                if blk["block_id"] == block_id:
+                    return blk
+        return None
+
+    async def _recover_block(
+        self, block_id: str, status: dict, blk_meta: dict
+    ) -> None:
+        """Replace one dead peer in a Raft group with a healthy spare.
+
+        Strategy: find a live DataNode not already in the group, call AddPeer
+        on the group leader, then call RemovePeer for the dead node.
+        """
+        async with self._lock:
+            if block_id in self._recovering_blocks:
+                return
+            self._recovering_blocks.add(block_id)
+            current_peers: List[str] = list(blk_meta.get("peers", []))
+            leader_dn: Optional[str] = status.get("leader_id")
+
+        logger.info(
+            "recovery[%.8s]: starting — current_peers=%s leader=%s",
+            block_id, current_peers, leader_dn,
+        )
+
+        try:
+            # Identify live DataNodes not already in the group.
+            async with self._lock:
+                avail = self._available_dns()
+                spares = [dn for dn in avail if dn not in current_peers]
+
+            if not spares:
+                logger.warning(
+                    "recovery[%.8s]: no spare DataNodes available — will retry later",
+                    block_id,
+                )
+                async with self._lock:
+                    self._recovering_blocks.discard(block_id)
+                return
+
+            new_peer_dn = spares[0]
+
+            # Identify a dead peer to remove (first in current_peers not live).
+            async with self._lock:
+                live_set = set(self._available_dns())
+                dead_peers = [p for p in current_peers if p not in live_set]
+
+            if not dead_peers:
+                logger.info(
+                    "recovery[%.8s]: all peers now live — skipping replacement",
+                    block_id,
+                )
+                async with self._lock:
+                    self._recovering_blocks.discard(block_id)
+                return
+
+            dead_peer = dead_peers[0]
+
+            # We need the leader's address to call AddPeer / RemovePeer.
+            # If the old leader is dead, try any live peer in the group.
+            leader_addr = await self._resolve_live_leader(block_id, current_peers)
+            if leader_addr is None:
+                logger.warning(
+                    "recovery[%.8s]: cannot reach any group peer — will retry later",
+                    block_id,
+                )
+                async with self._lock:
+                    self._recovering_blocks.discard(block_id)
+                return
+
+            async with self._lock:
+                new_peer_info = self._registered_dns.get(new_peer_dn)
+            if not new_peer_info:
+                async with self._lock:
+                    self._recovering_blocks.discard(block_id)
+                return
+
+            new_peer_addr = f"{new_peer_info['host']}:{new_peer_info['port']}"
+
+            async with self._lock:
+                dead_peer_info = self._registered_dns.get(dead_peer)
+            dead_peer_addr = (
+                f"{dead_peer_info['host']}:{dead_peer_info['port']}"
+                if dead_peer_info
+                else dead_peer
+            )
+
+            logger.info(
+                "recovery[%.8s]: adding %s (%s), removing %s (%s) via leader %s",
+                block_id, new_peer_dn, new_peer_addr,
+                dead_peer, dead_peer_addr, leader_addr,
+            )
+
+            # AddPeer on the leader.
+            try:
+                async with aio.insecure_channel(
+                    leader_addr, options=_GRPC_OPTIONS
+                ) as ch:
+                    stub = datanode_pb2_grpc.DataNodeStub(ch)
+                    resp = await stub.AddPeer(
+                        datanode_pb2.AddPeerRequest(
+                            block_id=block_id,
+                            new_peer_addr=new_peer_addr,
+                        )
+                    )
+                if not resp.ok:
+                    logger.warning(
+                        "recovery[%.8s]: AddPeer failed: %s", block_id, resp.error
+                    )
+                    async with self._lock:
+                        self._recovering_blocks.discard(block_id)
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "recovery[%.8s]: AddPeer RPC error: %s", block_id, exc
+                )
+                async with self._lock:
+                    self._recovering_blocks.discard(block_id)
+                return
+
+            logger.info(
+                "recovery[%.8s]: AddPeer %s succeeded — now removing %s",
+                block_id, new_peer_addr, dead_peer_addr,
+            )
+
+            # RemovePeer on the leader.
+            try:
+                async with aio.insecure_channel(
+                    leader_addr, options=_GRPC_OPTIONS
+                ) as ch:
+                    stub = datanode_pb2_grpc.DataNodeStub(ch)
+                    resp = await stub.RemovePeer(
+                        datanode_pb2.RemovePeerRequest(
+                            block_id=block_id,
+                            peer_addr=dead_peer_addr,
+                        )
+                    )
+                if not resp.ok:
+                    logger.warning(
+                        "recovery[%.8s]: RemovePeer failed: %s", block_id, resp.error
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "recovery[%.8s]: RemovePeer RPC error: %s", block_id, exc
+                )
+
+            # _recovering_blocks is cleared by UpdateBlockPeers once the
+            # CONFIG commit is acknowledged; we clear it here too as a safety
+            # net in case UpdateBlockPeers never arrives.
+            async with self._lock:
+                self._recovering_blocks.discard(block_id)
+
+        except Exception as exc:
+            logger.error(
+                "recovery[%.8s]: unexpected error: %s", block_id, exc, exc_info=True
+            )
+            async with self._lock:
+                self._recovering_blocks.discard(block_id)
+
+    async def _resolve_live_leader(
+        self, block_id: str, peers: List[str]
+    ) -> Optional[str]:
+        """Return the host:port of a live node in the group that claims to be leader.
+
+        Tries the recorded leader first, then falls back to any live peer.
+        """
+        async with self._lock:
+            status = self._block_status.get(block_id, {})
+            recorded_leader = status.get("leader_id")
+            live_set = set(self._available_dns())
+
+        # Prefer the last known leader if it's live.
+        if recorded_leader and recorded_leader in live_set:
+            info = self._registered_dns.get(recorded_leader)
+            if info:
+                return f"{info['host']}:{info['port']}"
+
+        # Fall back to any live group member.
+        for dn_id in peers:
+            if dn_id in live_set:
+                info = self._registered_dns.get(dn_id)
+                if info:
+                    return f"{info['host']}:{info['port']}"
+
+        return None
 
 
 # ── Server bootstrap ───────────────────────────────────────────────────────
@@ -838,6 +1086,7 @@ async def serve(config: dict) -> None:
     # Start background tasks.
     asyncio.create_task(servicer._heartbeat_watchdog())
     asyncio.create_task(servicer._deletion_loop())
+    asyncio.create_task(servicer._recovery_watchdog())
     if servicer._delete_queue:
         logger.info(
             "Resuming %d pending block deletion(s) from previous run",

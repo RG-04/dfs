@@ -18,6 +18,11 @@ dn_heartbeat_interval: 10
 # 2 × dn_heartbeat_interval to tolerate one missed heartbeat.
 dn_liveness_timeout: 30
 
+# Seconds a block must remain unavailable before the Master triggers automatic
+# peer replacement.  Default: 3 × heartbeat_timeout (45 s).  Set to 0 to
+# disable automatic recovery.
+# recovery_threshold: 45
+
 master:
   host: "127.0.0.1"
   port: 50051
